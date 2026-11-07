@@ -7,6 +7,7 @@ non-serialisable attributes are needed at runtime.
 import random
 
 from card_utils import Card, evaluate, full_deck
+from all_in_equity import expected_call_payout
 from game_state import GameStateView
 from player_action import PlayerAction
 from preflop_policy import (
@@ -161,14 +162,29 @@ class Model:
                 for player in remaining_opponents
             )
         ):
-            # Multiway equity includes EVERY remaining hand, not only the
-            # last player to shove. Calling is the only non-fold option.
-            equity = self._equity(
-                [], len(remaining_opponents),
-                samples=240 if len(remaining_opponents) == 1 else 180,
+            # Calling closes the action, but unequal all-in stacks create
+            # separate main/side pots. Outright showdown equity would miss
+            # side-pot wins, so compare *expected chips returned* against
+            # the incremental cost of calling instead.
+            samples = 280 if len(remaining_opponents) <= 2 else 160
+            payout = expected_call_payout(
+                self.hand,
+                list(game_state.board),
+                game_state.bets,
+                game_state.folded,
+                game_state.button,
+                self.player_id,
+                cost,
+                samples=samples,
+                seed=self.random_seed,
             )
-            margin = 0.035 if current <= 11 * bb else 0.075
-            if equity >= game_state.pot_odds + margin:
+            self.random_seed = (
+                self.random_seed * 1103515245 + 12345
+            ) & 0xFFFFFFFF
+            # Small risk premium absorbs Monte Carlo noise on close calls.
+            # This is chips, not a misleading multiway pot-odds fraction.
+            margin_chips = max(1.0, 0.025 * cost)
+            if payout >= cost + margin_chips:
                 return PlayerAction.call(self.player_id)
             return PlayerAction.fold(self.player_id)
 
