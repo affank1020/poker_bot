@@ -1,0 +1,85 @@
+name: V2 final integration validation
+
+on:
+  pull_request:
+    paths:
+      - 'model.py'
+      - 'tests/test_v2_integration.py'
+      - '.github/workflows/v2-integration.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  integration:
+    name: Full tests, clean submission and paired V1 validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out complete history for frozen V1
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Install existing development dependencies
+        run: python -m pip install -r requirements-dev.txt
+
+      - name: '1. Run full regression suite'
+        run: python -m pytest -q
+
+      - name: '2. Build and validate actual submission'
+        run: python -m submit --team v2integration --out /tmp
+
+      - name: '3. Smoke benchmark against pinned V1'
+        run: python tools/benchmark.py --smoke --output /tmp/v2-smoke.json
+
+      - name: '4. Test 100 seeded decks against all six dummies'
+        run: |
+          set -o pipefail
+          python -m evals --opponents tight equity shove call fold random --deals 100 | tee /tmp/v2-evals100.txt
+          python - <<'PY'
+          from pathlib import Path
+          names = set("tight equity shove call fold random".split())
+          lines = [line.split() for line in Path("/tmp/v2-evals100.txt").read_text().splitlines()]
+          rows = [parts for parts in lines if parts and parts[0] in names]
+          assert len(rows) == 6, "Expected a result for each dummy"
+          for parts in rows:
+              assert int(parts[-2]) == 0, f"Faults against {parts[0]}: {parts[-2]}"
+          PY
+
+      - name: '5. Run paired V1/V2 100-deal comparison'
+        run: |
+          python tools/benchmark.py --deals 100 --times 1 \
+            --opponents tight equity shove call fold random \
+            --output /tmp/v2-paired100.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          report = json.loads(Path("/tmp/v2-paired100.json").read_text())
+          for name, entry in report["comparisons"].items():
+              faults = entry["candidate"]["faults"]
+              assert all(faults[k] == 0 for k in ("faults", "illegal", "timeouts")), (
+                  f"{name}: {faults}"
+              )
+          PY
+
+      - name: Upload development-only validation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: v2-integration-validation
+          path: |
+            /tmp/v2-smoke.json
+            /tmp/v2-evals100.txt
+            /tmp/v2-paired100.json
+          if-no-files-found: ignore
+          retention-days: 2
