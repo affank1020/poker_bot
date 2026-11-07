@@ -25,11 +25,17 @@ import time
 # The exact V1 snapshot, committed before any V2 code was merged.
 V1_SHA = "83f2ffb4ac2bdfa6f4371f0a4c610b558f47d893"
 OPPONENTS = ("tight", "equity", "shove", "call", "fold", "random")
-# A difference here invalidates a strict paired comparison.
+# Every repository-local module on the executed evaluation path:
+# match/dealing, player construction, dummy opponents, remote/worker interface,
+# action validation, card evaluation, and scoring. Strategy model.py and
+# its policy dependencies are intentionally excluded so they may differ.
+# A mismatch makes an otherwise paired comparison misleading.
 EVALUATION_FILES = (
-    "arena/match.py", "arena/dummies.py", "arena/remote.py",
-    "arena/worker.py", "engine.py", "card_utils.py", "game_state.py",
-    "player_action.py", "evals/score.py", "evals/stats.py",
+    "arena/__init__.py", "arena/match.py", "arena/players.py",
+    "arena/dummies.py", "arena/remote.py", "arena/worker.py",
+    "engine.py", "game_interface.py", "card_utils.py", "game_state.py",
+    "player_action.py", "evals/__init__.py", "evals/score.py",
+    "evals/stats.py",
 )
 
 
