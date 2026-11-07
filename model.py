@@ -9,6 +9,21 @@ import random
 from card_utils import Card, evaluate, full_deck
 from game_state import GameStateView
 from player_action import PlayerAction
+from preflop_policy import (
+    HU_DEFEND,
+    HU_FOLD_UNOPENED,
+    HU_FOUR_BET_SHOVE,
+    HU_ISOLATE_LIMP,
+    HU_OPEN,
+    HU_SHOVE_6BB,
+    HU_SHOVE_11BB,
+    HU_THREE_BET,
+    HU_VS_THREE_BET,
+    MULTI_DEFEND,
+    MULTI_OPEN,
+    MULTI_THREE_BET,
+    hand_class,
+)
 
 
 class Model:
@@ -64,22 +79,6 @@ class Model:
                 return self.opponents.get(game_state.teams[player], {})
         return {}
 
-    def _score(self):
-        """Fast starting-hand ranking, deliberately not a true equity estimate."""
-        high, low = sorted((card.value for card in self.hand), reverse=True)
-        suited = self.hand[0].suit == self.hand[1].suit
-        if high == low:
-            return 53.0 + 3.5 * (high - 2)
-        gap = max(0, high - low - 1)
-        score = (
-            9.0 + high * 2.6 + low * 1.45
-            + (8.0 if suited else 0.0)
-            + (12.0 if high == 14 else 0.0)
-            + (3.0 if high >= 11 and low >= 10 else 0.0)
-            - min(8.0, gap * 2.0)
-        )
-        return score
-
     def _equity(self, board, opponents, samples=120):
         """Monte Carlo showdown equity vs uniform unknown hands; ties are split."""
         unavailable = set(self.hand + board)
@@ -121,29 +120,55 @@ class Model:
         return PlayerAction.fold(self.player_id)
 
     def _preflop(self, game_state):
-        score = self._score()
+        """25-BB hand-class ranges, with explicit short-stack fallbacks.
+
+        Ranges are design approximations, not solved equilibrium tables.
+        All actions are checked and raise totals are clamped by _raise().
+        """
+        hand = hand_class(self.hand)
         bb = game_state.big_blind
-        call = game_state.call_amount
-        stack = game_state.stacks[self.player_id]
+        cost = game_state.call_amount
         current = game_state.current_bet
-        button = game_state.button == self.player_id
-        opponents = max(1, len(game_state.players_in_hand) - 1)
+        stack = game_state.stacks[self.player_id]
+        heads_up = game_state.num_players == 2
+        effective_bb = (
+            game_state.effective_stack(self.player_id)
+            + game_state.bets[self.player_id]
+        ) / bb
         stats = self._primary_opponent_stats(game_state)
+        opponents = max(1, len(game_state.players_in_hand) - 1)
 
-        # Unraised pot: the SB can open or complete; the BB can check or raise.
         if current <= bb:
-            if button:
-                if score >= 51 and game_state.can_raise:
-                    return self._raise(game_state, round(2.4 * bb))
+            if heads_up:
+                if game_state.button == self.player_id:
+                    # SB acts first heads-up. A short-stack jam can deny
+                    # equity more effectively than a tiny open raise.
+                    if effective_bb <= 6 and hand in HU_SHOVE_6BB:
+                        return self._raise(game_state, game_state.max_raise_to)
+                    if effective_bb <= 11 and hand in HU_SHOVE_11BB:
+                        return self._raise(game_state, game_state.max_raise_to)
+                    if hand in HU_OPEN:
+                        target = round((2.0 if effective_bb <= 12 else 2.3) * bb)
+                        return self._raise(game_state, target)
+                    if hand in HU_FOLD_UNOPENED:
+                        return PlayerAction.fold(self.player_id)
+                    return PlayerAction.call(self.player_id)  # complete
+                # BB facing a limp: check most hands, isolate for value.
+                if cost == 0 and hand in HU_ISOLATE_LIMP:
+                    return self._raise(game_state, round(3.2 * bb))
                 return PlayerAction.call(self.player_id)
-            if call == 0 and score >= 62 and game_state.can_raise:
-                return self._raise(game_state, 3 * bb)
-            return PlayerAction.call(self.player_id)
 
-        # Large commitments / shoves need pot-odds-based decisions.
-        # This is intentionally conservative against unknown opponents.
-        if call >= max(4 * bb, int(0.3 * (stack + game_state.bets[self.player_id]))):
-            equity = self._equity([], opponents, samples=180 if opponents == 1 else 75)
+            # Tighten significantly when 3+ players were seated.
+            if hand in MULTI_OPEN:
+                return self._raise(game_state, 3 * bb)
+            if cost == 0 or hand in MULTI_DEFEND:
+                return PlayerAction.call(self.player_id)
+            return self._check_or_fold(game_state)
+
+        # Preserve the v1 showdown-equity guard against very large raises
+        # and shoves. Dedicated opponent ranges are planned for the next PR.
+        if cost >= max(4 * bb, int(0.30 * (stack + game_state.bets[self.player_id]))):
+            equity = self._equity([], opponents, samples=180 if heads_up else 75)
             observed = stats.get("raises", 0) + stats.get("calls", 0)
             frequent_shover = (
                 observed >= 5
@@ -155,21 +180,28 @@ class Model:
                 return PlayerAction.call(self.player_id)
             return PlayerAction.fold(self.player_id)
 
-        # Value 3-bet the top range; avoid spending the stack with weak cards.
-        if score >= 84 and game_state.can_raise:
-            if score >= 91 and game_state.effective_stack(self.player_id) <= 18 * bb:
+        # A raise to 5.5+ BB is commonly a 3-bet at normal stack depths.
+        # Do not call cheaply with weak drawing hands at 25 BB.
+        if current >= 5.5 * bb:
+            if heads_up and hand in HU_FOUR_BET_SHOVE and game_state.can_raise:
                 return self._raise(game_state, game_state.max_raise_to)
-            return self._raise(game_state, round(2.7 * current))
+            defend = HU_VS_THREE_BET if heads_up else MULTI_THREE_BET
+            if hand in defend and cost <= 7 * bb and cost <= 0.37 * stack:
+                return PlayerAction.call(self.player_id)
+            return self._check_or_fold(game_state)
 
-        # Defend wider against small raises, but respect the size of the bet.
-        threshold = 55 if button else 57
-        if call <= 2 * bb:
-            threshold -= 4
-        elif call >= 4 * bb:
-            threshold += 8
-        if opponents > 1:
-            threshold += 8
-        if score >= threshold and call <= max(4 * bb, int(0.22 * stack)):
+        value_three_bet = HU_THREE_BET if heads_up else MULTI_THREE_BET
+        if hand in value_three_bet and game_state.can_raise:
+            if effective_bb <= 14 and hand in HU_FOUR_BET_SHOVE:
+                return self._raise(game_state, game_state.max_raise_to)
+            return self._raise(game_state, round(2.8 * current))
+
+        defend = HU_DEFEND if heads_up else MULTI_DEFEND
+        if (
+            hand in defend
+            and cost <= (3.2 if heads_up else 2.5) * bb
+            and cost <= 0.26 * stack
+        ):
             return PlayerAction.call(self.player_id)
         return self._check_or_fold(game_state)
 
