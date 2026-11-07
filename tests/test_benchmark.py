@@ -72,16 +72,34 @@ def test_incomplete_seat_rotation_rejected():
         _deal_samples([match], "candidate")
 
 
-def test_evaluation_mismatch_is_fail_closed(tmp_path):
+def _matching_evaluators(tmp_path):
     baseline, candidate = tmp_path / "v1", tmp_path / "candidate"
     for root in (baseline, candidate):
         for name in EVALUATION_FILES:
             path = root / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(b"same")
+    return baseline, candidate
+
+
+@pytest.mark.parametrize("name", EVALUATION_FILES)
+def test_evaluation_mismatch_is_fail_closed(tmp_path, name):
+    baseline, candidate = _matching_evaluators(tmp_path)
     _check_same_evaluation(baseline, candidate)
-    (candidate / "arena" / "match.py").write_bytes(b"different")
-    with pytest.raises(RuntimeError, match="arena/match.py"):
+    (candidate / name).write_bytes(b"different")
+    with pytest.raises(RuntimeError, match=name.replace(".", r"\\.").replace("/", r"\/")):
+        _check_same_evaluation(baseline, candidate)
+
+
+@pytest.mark.parametrize("name", ["game_interface.py", "arena/players.py"])
+def test_guard_contains_critical_player_interface_dependencies(name):
+    assert name in EVALUATION_FILES
+
+
+def test_evaluation_missing_file_is_fail_closed(tmp_path):
+    baseline, candidate = _matching_evaluators(tmp_path)
+    (candidate / "game_interface.py").unlink()
+    with pytest.raises(RuntimeError, match="game_interface.py"):
         _check_same_evaluation(baseline, candidate)
 
 
