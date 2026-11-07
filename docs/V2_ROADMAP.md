@@ -8,7 +8,9 @@ _Last updated: 7 November 2026._
 
 Deliver the strongest **working, legal, submission-ready** no-limit Texas Hold'em bot we can within the hackathon window. Favor safe, benchmarked incremental improvements over untested complexity.
 
-**Hybrid rather than training from scratch:** deterministic, auditable street policies + equity calculation (Monte Carlo/exact as appropriate) + **persistent opponent statistics and weighted ranges**. Our hand-designed charts are approximate, not certified solver/GTO charts; avoid unrealistic claims. A large new neural agent / runtime LLM dependency is not a good fit for the current deadline, data, runtime and packaging limits.
+**Hybrid rather than training from scratch:** deterministic, auditable street policies + equity calculation (Monte Carlo/exact as appropriate) + **persistent opponent statistics, opponent-conditioned ranges and confidence-gated counter-strategies**. Our hand-designed charts are approximate, not certified solver/GTO charts; avoid unrealistic claims. A large new neural agent / runtime LLM dependency is not a good fit for the current deadline, data, runtime and packaging limits.
+
+**Opponent modelling is a first-class strategy pillar, not a passive statistics collector.** The bot should learn from successive hands against each team, infer actionable tendencies and, with enough evidence, *change its preflop/flop/turn/river decisions to exploit that specific opponent*. It must remain competitive on hand 1 against an unknown opponent. The first safe implementation is a robust persistent baseline; adaptive exploitation is an independently testable enhancement, not a prerequisite for every street to work.
 
 The **four stages** refer to the four betting streets: **preflop → flop → turn → river**. Cross-cutting opponent modelling, equity helpers, tests, CI and integration support all four stages.
 
@@ -73,15 +75,54 @@ The **four stages** refer to the four betting streets: **preflop → flop → tu
 
 **Submitted strategy:** terminal equity + straightforward call/bet EV instead of projecting future-card equity.
 
-## Shared workstream A — persistent opponent model (may run parallel with PR #2)
+## Shared workstream A — opponent intelligence and adaptation (**strategic priority**)
 
-- [ ] **Standalone new module and tests first; no `model.py` modification while PR #2 is being repaired.**
-- [ ] Maintain per-team statistics across hands; stratify by street and **opportunities**, not merely raw counts: VPIP/PFR-like signals, fold to bet, aggression, showdown tendencies when legally observed.
-- [ ] Track hand-local action context and consume **each incremental action exactly once**; correctly distinguish dealer board reveals and player showdown reveals.
-- [ ] Use shrinkage/smoothing and minimum sample thresholds; very low samples should behave near conservative default prior, not extreme exploit.
-- [ ] Provide small API for opponent profiles/range weighting. Observe betting sequence without illicit information or post-hoc access to private state.
-- [ ] Test changing seats, multiple opponents, new hands, duplicate action streams, late end-game streams, pickle preservation, unknown teams and legal public showdown data.
-- [ ] Integrate after preflop review, by a coordinator-owned small `model.py` wiring PR.
+### A1. Persistent observation + inference — **strong baseline, build first**
+
+- [ ] **Standalone module + tests first; no `model.py` modification while PR #2 is being repaired.**
+- [ ] Persist independent profiles **per team name**, not seat, across all hands in a match. Reset hand-local trackers in `seed` without resetting match memory. Tournament mode keeps the same model instance across hands; **do not assume memory is automatically shared between separate matches/rounds** unless the organiser explicitly restores a checkpoint.
+- [ ] Track **opportunities and outcomes**, not just actions: e.g. preflop voluntarily entering a pot / raises / 3-bets; facing bets and folding or calling on each street; postflop aggression; showdown cards *only when actually revealed*. Separate preflop/flop/turn/river and bet-size buckets where sample count justifies it.
+- [ ] Consume the incremental `run`/`end_game` action streams exactly once; preserve hand context/board progression, including dealer vs player `reveal_card`, blind posting, and seat changes.
+- [ ] Estimate tendencies with smoothed rates (e.g. Beta/binomial prior or empirical-Bayes/shrinkage) and confidence / observation counts. **Unknown opponents use the broad default prior**; never label someone a habitual bluffer from one hand.
+- [ ] Convert public preflop and later street action history into **opponent-conditioned plausible hand ranges**, with card removal, street-by-street weighting and a safe fallback for sparse data. Do not pretend to know folded cards or unshown hole cards.
+- [ ] Provide a small stable API (illustrative): `observe(actions, view, hero_id)`, `profile(team)`, `range_weights(team, street, public_context)`, `confidence(team, feature)`. Keep data pickle-safe and bounded.
+- [ ] Test across hands, seat swaps, multiway, action-stream boundaries, sparse observations, showdown reveals, pickle/restore, and zero illegal actions when integrated.
+
+**A1 completion gate:** model actually updates its estimates from repeated hands; four street policies can consume them; tests demonstrate hand-to-hand persistence and correct priors. This is the **baseline intelligent opponent model**, even if no explicit exploit overlay is enabled.
+
+### A2. Confidence-gated counter-strategy — **high-value incremental improvement**
+
+- [ ] Start with a small *interpretable* set of tendencies, not a heavyweight classifier: **tight/passive**, **loose/passive (calling station)**, **aggressive / over-bluffing**, and **over-folding**. These are descriptive hypotheses, not ground truth; model each by observable rates and sample confidence.
+- [ ] Expose an `exploit_adjustment(team, street, context)` (or equivalent) that makes **bounded changes** to default ranges, equity thresholds and bet/bluff sizing. Base every adjustment on the applicable opportunity denominator and enough evidence.
+- [ ] Concrete, testable counters:
+  - **Calls too often / folds rarely:** bluff less; value bet stronger and sometimes thinner; do not blindly fold good value hands.
+  - **Folds too often to bets:** increase selective steals / bluffs when range and stack permit, with capped sizing/frequency.
+  - **Raises/3-bets tightly:** defend tighter against credible aggression while stealing more when they surrender the blinds.
+  - **Raises extremely widely:** value-bet/3-bet stronger hands more and bluff-catch more *only when observed evidence supports a wider range*.
+- [ ] Use adjustments throughout **all four streets**: preflop opens/defends/3-bets, flop continuation-bet/call decisions, turn barreling/defence, and river value-vs-bluff-catching. Correct application matters more than complex taxonomy.
+- [ ] **Safety gate:** when sample size is small, a stat's context is inapplicable, or opponents appear balanced, use A1/default policy. Smooth estimates, cap adjustment magnitude, and avoid conflicting overrides. No secret reads, unbounded growth or runtime complexity.
+- [ ] Evaluate **A1 baseline vs A1+A2 adaptation** on repeated seeded matches against distinct known opponent styles, including changing styles and an unknown/balanced opponent. Require legal moves, stable runtime and credible gains without a severe balanced-opponent regression.
+
+**A2 completion gate:** a reproducible test shows the **same hero hand + public state** can produce an appropriately different legal action against two opponents with well-supported different observed histories; live match tests show useful adaptation as more hands are played. If results are noisy/negative near the deadline, leave A2 behind a simple opt-out and ship A1.
+
+### A3. Extended / recency-aware memory — **optional, not on critical path**
+
+- [ ] **Only after A1+A2 are stable:** maintain bounded long-run statistics **plus a small recent-hands view** (EWMA or fixed-size rolling counts per opponent). Detect *possible* shifts from loose to tight or vice versa and let recent evidence cautiously influence the model.
+- [ ] Avoid full hand-history storage, a learned opponent neural network, online gradient training, HMMs or giant archetype ensembles under this deadline. They add variance, state bugs and integration risk for uncertain benefit.
+- [ ] Benchmark when opponents deliberately switch styles mid-match; verify false switch detection does not destabilise play. If not convincingly better, defer.
+
+**Priority rule:** A1 must be integrated early, before all four street policies are finalized; A2 is a scoped, high-value upgrade; A3 is explicitly a stretch goal. *Persistent across-hands memory already belongs to A1.* “Extended memory” means additionally tracking recency/change, **not** making persistence work for the first time.
+
+### How opponent intelligence informs the four streets
+
+| Street | A1 inference used by baseline | A2 exploit (only with confidence) |
+|---|---|---|
+| Preflop | Position/action-aware opening, call and 3-bet ranges | Adjust steals, defends and value 3-bets versus opponent aggression/folds |
+| Flop | Weight likely holdings from preflop and flop betting; derive equity | Selectively adjust continuation bets, value sizing and calling thresholds |
+| Turn | Update posterior range after turn action and board card | Adjust second barrels, protection and defence against credible pressure |
+| River | Estimate final showdown equity and opponent bet/value ranges | Choose thin value, folds, bluff-catches and rare bluffs based on call/fold/bluff tendencies |
+
+**Important:** pure card equity is not equal to betting EV. Use observed action tendencies to condition ranges and fold-equity assumptions, rather than subtracting a universal constant from equity after a raise.
 
 ## Shared workstream B — equity/range engine
 
@@ -104,7 +145,7 @@ The **four stages** refer to the four betting streets: **preflop → flop → tu
 2. Shared contract to converge on: `OpponentModel` consumes public incremental `actions` and view/own id, returns per-team/street smoothed profiles (and optional range weights); equity helper takes hero cards, public board, number of opponents and weighted priors with compute budget; policies operate on shared state and produce a legal `PlayerAction` or a validated recommendation.
 3. Do not couple street policies to unmerged speculative internals. Write independent testable modules first and keep adapters narrow.
 4. Each PR description documents: stage/scope, dependencies, design assumptions, review findings, tests, benchmark numbers, packaging impact, and exact integration points.
-5. **Merge order** (development may overlap): **PR #2 preflop → opponent/range helpers → flop → turn → river → final integration/validation**.
+5. **Merge order** (development may overlap): **PR #2 preflop → A1 opponent observation/inference + range helpers → flop → turn → river → A2 confidence-gated exploits if benchmarked → final integration/validation**. A3 recency-aware memory is stretch only; A2 can be prototyped in parallel but must not block street functionality.
 6. Every merge must clear review concerns, full CI + submit packaging and V1 comparative evaluation. Prefer to drop a risky feature rather than break a working final submission.
 7. To coordinate across chats, link new PRs and record status/decisions **here**; do not use stale chat memory as a hidden dependency.
 
@@ -112,5 +153,6 @@ The **four stages** refer to the four betting streets: **preflop → flop → tu
 
 - **2026-11-07:** Chose hybrid incremental V2 over training a new model. Prioritize four poker streets and persistent opponent modelling. V1 frozen on `main`; PR #2 is open, fixing review findings; independent opponent-model work can proceed without touching `model.py`. CI introduced in PR #2. Development can run in parallel; integration stays sequential.
 - **2026-11-07:** GitHub repository has **Issues disabled** (HTTP 410 from issue creation). This tracked document is the durable alternative. If Issues are enabled later, open one canonical tracking issue linking this file.
+- **2026-11-07 (opponent-model priority):** Promote opponent profiling and adaptation to a first-class pillar across preflop/flop/turn/river. Distinguish **A1 persistent cross-hand observations/ranges (baseline)**, **A2 bounded confidence-gated counter-strategy (high-value upgrade)** and **A3 recency-aware change detection (optional stretch)**. No heavy online training or forced A3 implementation in the critical path.
 
 > **For a new agent/chat:** Read this roadmap and PR #2 (including current review threads), inspect repository and CI, claim a non-overlapping workstream, and update this document/PR links when the state changes.
