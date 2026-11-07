@@ -1,5 +1,6 @@
 """Small, deterministic checks for development-only benchmark accounting."""
 from pathlib import Path
+import re
 from types import SimpleNamespace
 
 import pytest
@@ -87,7 +88,7 @@ def test_evaluation_mismatch_is_fail_closed(tmp_path, name):
     baseline, candidate = _matching_evaluators(tmp_path)
     _check_same_evaluation(baseline, candidate)
     (candidate / name).write_bytes(b"different")
-    with pytest.raises(RuntimeError, match=name.replace(".", r"\\.").replace("/", r"\/")):
+    with pytest.raises(RuntimeError, match=re.escape(name)):
         _check_same_evaluation(baseline, candidate)
 
 
