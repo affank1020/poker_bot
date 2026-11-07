@@ -155,6 +155,14 @@ class OpponentModel:
                 # Cannot recover an unacted, potentially short blind from
                 # a postflop snapshot. Unknown cost is not a free check.
                 invested[seat] = None
+        # An unknown contribution is still bounded by the corresponding
+        # nominal blind. These ceilings let later raises prove that an
+        # otherwise ambiguous call was voluntary without inventing chips.
+        bet_ceilings = [0] * len(names)
+        bet_ceilings[small] = (invested[small] if invested[small] is not None
+                               else game_state.small_blind)
+        bet_ceilings[big] = (invested[big] if invested[big] is not None
+                             else game_state.big_blind)
         initial_bet = (max(invested) if all(bet is not None for bet in invested)
                        else None)
         for i, name in enumerate(names):
@@ -166,9 +174,13 @@ class OpponentModel:
             "street": "preflop",
             "board_reveals": 0,
             "bets": invested,
+            "bet_ceilings": bet_ceilings,
             "current_bet": initial_bet,
             "preflop_raises": 0,
             "preflop_acted": set(),
+            # An unclassifiable preflop call must not count as non-VPIP.
+            # A later confirmed voluntary action can classify the hand.
+            "preflop_ambiguous": set(),
             "vpip": set(),
             "pfr": set(),
             "shown": {},
@@ -197,6 +209,7 @@ class OpponentModel:
                     if next_street is not None:
                         hand["street"] = next_street
                         hand["bets"] = [0] * len(hand["teams"])
+                        hand["bet_ceilings"] = [0] * len(hand["teams"])
                         hand["current_bet"] = 0
                 elif 0 <= pid < len(hand["teams"]) and pid != hero_id:
                     name = hand["teams"][pid]
@@ -214,6 +227,13 @@ class OpponentModel:
             current_bet = hand["current_bet"]
             cost = (max(0, current_bet - old_bet)
                     if current_bet is not None and old_bet is not None else None)
+            if cost is None and current_bet is not None:
+                # A raise above the maximum possible prior contribution
+                # proves a subsequent call is voluntary, even without
+                # knowing the exact size of an earlier short blind/call.
+                minimum_cost = current_bet - hand["bet_ceilings"][pid]
+                if minimum_cost > 0:
+                    cost = minimum_cost
             # A preflop SB completion faces the forced BB, not aggression.
             # An unknown blind cost must not be mistaken for a free check.
             unraised = street == "preflop" and hand["preflop_raises"] == 0
@@ -226,10 +246,21 @@ class OpponentModel:
                 hand["lines"][name][street].append(action.kind)
                 if street == "preflop":
                     hand["preflop_acted"].add(name)
-                    if action.kind == "raise" or (action.kind == "call" and cost is not None and cost > 0):
-                        hand["vpip"].add(name)
                     if action.kind == "raise":
+                        # A definite raise is VPIP/PFR regardless of any
+                        # earlier ambiguous preflop call.
+                        hand["vpip"].add(name)
                         hand["pfr"].add(name)
+                        hand["preflop_ambiguous"].discard(name)
+                    elif action.kind == "call" and cost is None:
+                        # Don't treat unknown check-vs-call as a no-VPIP
+                        # hand. Exclude it from both VPIP and PFR rate
+                        # denominators unless later evidence resolves it.
+                        if name not in hand["vpip"]:
+                            hand["preflop_ambiguous"].add(name)
+                    elif action.kind == "call" and cost > 0:
+                        hand["vpip"].add(name)
+                        hand["preflop_ambiguous"].discard(name)
                     if hand["preflop_raises"] == 1:
                         record["three_bet_opportunities"] += 1
                         if action.kind == "raise":
@@ -262,6 +293,7 @@ class OpponentModel:
             # actions, never from the final GameStateView.bets snapshot.
             if action.kind == "raise":
                 hand["bets"][pid] = action.amount
+                hand["bet_ceilings"][pid] = action.amount
                 hand["current_bet"] = action.amount
                 if street == "preflop":
                     hand["preflop_raises"] += 1  # hero raises count too
@@ -269,6 +301,11 @@ class OpponentModel:
                 hand["bets"][pid] = (max(old_bet, hand["current_bet"])
                                      if old_bet is not None and hand["current_bet"] is not None
                                      else None)
+                # A call is no larger than the current betting target.
+                # Prior to a voluntary preflop raise it is <= the BB.
+                ceiling = (hand["current_bet"] if hand["current_bet"] is not None
+                           else game_state.big_blind)
+                hand["bet_ceilings"][pid] = max(hand["bet_ceilings"][pid], ceiling)
             # Fold does not change current_bet.
 
     def end_hand(self, actions, game_state, hero_id, batch_id=None):
@@ -286,7 +323,8 @@ class OpponentModel:
         for name in hand["lines"]:
             record = self._records[name]
             record["hands_seen"] += 1
-            if name in hand["preflop_acted"]:
+            if (name in hand["preflop_acted"]
+                    and name not in hand["preflop_ambiguous"]):
                 record["preflop_opportunities"] += 1
                 record["vpip_hands"] += name in hand["vpip"]
                 record["pfr_hands"] += name in hand["pfr"]
