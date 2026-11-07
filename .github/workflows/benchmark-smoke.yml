@@ -1,0 +1,51 @@
+name: Dev-only paired benchmark smoke
+
+on:
+  pull_request:
+    paths:
+      - 'tools/benchmark.py'
+      - 'tests/test_benchmark.py'
+      - 'docs/BENCHMARKING.md'
+      - '.github/workflows/benchmark-smoke.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    name: Pinned V1 vs candidate, seeded dummy smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout full history for exact frozen V1 commit
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Install existing development dependencies
+        run: python -m pip install -r requirements-dev.txt
+
+      - name: Check benchmark accounting
+        run: python -m pytest -q tests/test_benchmark.py
+
+      - name: Run independent smoke (not an efficacy claim)
+        run: |
+          python tools/benchmark.py --smoke --deals 4 \
+            --opponents tight equity shove call fold random \
+            --output /tmp/poker-benchmark-smoke.json
+
+      - name: Upload development-only report
+        uses: actions/upload-artifact@v4
+        with:
+          name: paired-benchmark-smoke
+          path: /tmp/poker-benchmark-smoke.json
+          retention-days: 2
