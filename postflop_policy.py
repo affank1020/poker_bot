@@ -14,9 +14,10 @@ from __future__ import annotations
 
 from collections import Counter
 from collections.abc import Sequence
+from itertools import combinations
 import random
 
-from card_utils import Card, evaluate
+from card_utils import Card, evaluate, full_deck
 from equity_engine import ComboWeights, estimate_equity
 from player_action import PlayerAction
 from sidepot_equity import estimate_call_payout
@@ -82,6 +83,20 @@ def _contestable_pot(view, player_id: int, cost: int) -> int:
         for seat, amount in enumerate(view.bets) if seat != player_id
     )
     return max(0, view.pot - excess)
+
+
+def _unbeatable_river(hero: Sequence[Card], board: Sequence[Card]) -> bool:
+    """Prove hero cannot lose against ANY legal hand, ignoring range priors.
+
+    Only used to rescue a river fold. At most C(45, 2) = 990 evaluations;
+    exit immediately on a beating hand. A sampled or range-restricted
+    no-loss estimate is insufficient for this guarantee.
+    """
+    known = tuple(hero) + tuple(board)
+    rank = evaluate(known)
+    deck = tuple(card for card in full_deck() if card not in known)
+    return all(evaluate(hand + tuple(board)) <= rank
+               for hand in combinations(deck, 2))
 
 
 def decide_postflop(
@@ -235,6 +250,18 @@ def decide_postflop(
         if cost >= max(view.big_blind * 3, int(0.8 * max(1, contestable_pot - cost))):
             required += 0.035
         if equity < required:
+            # An uncertainty premium must not fold a provably profitable
+            # call. Heads-up on the river, an unbeatable hand receives at
+            # least half the contestable pot, even if villain always ties.
+            # Round down for odd chips; require strictly positive chip EV.
+            # Multiway/side-pot decisions retain their existing policy.
+            if (
+                street == "river" and len(view.stacks) == 2 and not multiway
+                and equity >= 0.5
+                and (contestable_pot + cost) // 2 > cost
+                and _unbeatable_river(hero, view.board)
+            ):
+                return PlayerAction.call(player_id)
             return PlayerAction.fold(player_id)
         # Value raise only with convincingly strong showdown equity. The
         # minimum legal bet may be an all-in, handled by _raise_to.

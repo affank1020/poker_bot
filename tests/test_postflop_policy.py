@@ -49,12 +49,94 @@ def test_strong_river_value_bets_and_raise_total_is_legal():
     assert action.amount == 60  # total street bet, not chips added to pot
 
 
-def test_river_board_chop_checks_and_folds_when_price_is_bad():
+def test_river_board_chop_checks_and_does_not_rescue_zero_profit_call():
     hero, board = cards("2C 3D"), cards("AS KS QS JS TS")
     view = View(street="river", board=board)
     assert decide_postflop(hero, 0, view).kind == "call"
     view.call_amount, view.current_bet, view.raise_range = 100, 100, (200, 300)
     assert decide_postflop(hero, 0, view).kind == "fold"
+
+
+@pytest.mark.parametrize("board", [
+    "AS KS QS JS TS",  # Royal flush on board.
+    "AS KD QH JC TS",  # Broadway; no possible flush.
+    "AS AD AH AC KS",  # Quads with the best possible kicker.
+])
+@pytest.mark.parametrize("stacks", [(500, 500), (300, 1000)])
+def test_profitable_guaranteed_river_chop_calls_overbet(board, stacks):
+    """Real organiser state: rescue +20 chips, including an unmatched shove."""
+    from game_state import GameState, GameStateView
+    from player_action import PlayerAction
+    from engine import payouts
+
+    state = GameState(list(stacks))
+    state.process_action(PlayerAction.call(0))
+    state.process_action(PlayerAction.call(1))
+    community = cards(board)
+    for card in community[:3]:
+        state.deal_card(card)
+    for card in community[3:]:
+        state.process_action(PlayerAction.call(1))
+        state.process_action(PlayerAction.call(0))
+        state.deal_card(card)
+    state.process_action(PlayerAction.raise_to(1, state.max_raise_to))
+    cost = state.call_amount
+    hero = cards("2C 3D")
+    action = decide_postflop(
+        hero, 0, GameStateView(state), seed=7, facing_aggression=True,
+        contributions=(20, stacks[1]),
+    )
+    assert action.kind == "call"
+    state.validate_action(action)
+    state.process_action(action)
+    assert state.is_hand_over
+    returned = payouts(
+        [20 + cost, stacks[1]], [False, False],
+        [list(hero), list(cards("4C 5D"))], list(community), button=0,
+    )[0]
+    assert returned - cost == 20
+
+
+def test_range_restricted_chop_is_not_a_guaranteed_chop():
+    # The supplied range only ties, but two spades can beat this board.
+    # A range estimate must never serve as proof that calling cannot lose.
+    view = View(
+        street="river", board=cards("AS KS QS JH TC"),
+        pot=520, call_amount=480, current_bet=480,
+        bets=(0, 480), stacks=(480, 0), can_raise=False, raise_range=None,
+    )
+    assert decide_postflop(
+        cards("2C 3D"), 0, view, ranges=[{cards("4C 5D"): 1}],
+        seed=7, facing_aggression=True,
+    ).kind == "fold"
+
+
+def test_guaranteed_chop_override_does_not_change_multiway_policy():
+    view = View(
+        street="river", board=cards("AS KS QS JS TS"),
+        pot=1020, call_amount=480, current_bet=480,
+        players_in_hand=(0, 1, 2), bets=(0, 480, 480),
+        stacks=(480, 0, 0), can_raise=False, raise_range=None,
+    )
+    assert decide_postflop(
+        cards("2C 3D"), 0, view, seed=7, facing_aggression=True,
+        contributions=(20, 500, 500),
+    ).kind == "fold"
+
+
+def test_chop_override_leaves_folded_seat_pot_tiers_unchanged():
+    # More than two seats may create several odd-chip side-pot tiers,
+    # even with only one live opponent. The half-pot proof is HU-only.
+    view = View(
+        street="river", board=cards("AS KS QS JS TS"),
+        pot=530, call_amount=480, current_bet=480,
+        bets=(0, 480, 0), stacks=(480, 0, 490),
+        can_raise=False, raise_range=None,
+    )
+    assert decide_postflop(
+        cards("2C 3D"), 0, view, seed=7, facing_aggression=True,
+        contributions=(20, 500, 10),
+    ).kind == "fold"
 
 
 def test_value_raising_respects_min_and_max_raise_to():
