@@ -332,5 +332,76 @@ def test_unknown_blind_post_after_street_change_not_a_false_check_or_vpip():
                 reveal("2C"), reveal("7D"), reveal("9H")], river, 0)
     p = m.profile("small")
     assert p["vpip_hands"] == 0  # Unknown forced-blind difference.
+    assert p["preflop_opportunities"] == 0  # Unknown must not count as no-VPIP.
+    assert p["pfr_hands"] == 0
     assert p["streets"]["preflop"]["checks"] == 0
     assert p["streets"]["preflop"]["limps"] == 0
+
+
+def test_ambiguous_call_cannot_bias_denominator_across_many_hands():
+    m = OpponentModel()
+    late = state(teams=("hero", "small", "big"), button=0,
+                 bets=[0, 0, 0], street="river")
+    for _ in range(20):
+        m.new_hand()
+        # Short all-in hero could not act; initial blind amount is unknown.
+        m.end_hand([act(1, "call"), act(0, "call"),
+                    reveal("2C"), reveal("7D"), reveal("9H")], late, 0)
+    p = m.profile("small")
+    assert p["hands_seen"] == 20
+    assert p["preflop_opportunities"] == 0
+    assert p["vpip_hands"] == 0
+    assert p["rates"]["vpip"] == pytest.approx(PRIOR_RATES["vpip"])
+    assert p["rates"]["pfr"] == pytest.approx(PRIOR_RATES["pfr"])
+
+
+def test_definite_raise_after_unknown_call_restores_classifiable_vpip():
+    m = OpponentModel()
+    late = state(teams=("hero", "small", "big"), button=0,
+                 bets=[0, 0, 0], street="river")
+    m.new_hand()
+    m.end_hand([act(1, "call"), act(2, "raise", 60),
+                act(1, "raise", 120), act(2, "fold")], late, 0)
+    p = m.profile("small")
+    assert p["preflop_opportunities"] == 1
+    assert p["vpip_hands"] == 1
+    assert p["pfr_hands"] == 1
+
+
+def test_observable_call_and_definite_fold_still_count_opportunities():
+    m = OpponentModel()
+    s = state(button=1)
+    m.new_hand()
+    m.end_hand([act(1, "call"), act(0, "call")], s, 0)
+    m.new_hand()
+    m.end_hand([act(1, "fold")], s, 0)
+    p = m.profile("villain")
+    assert p["preflop_opportunities"] == 2
+    assert p["vpip_hands"] == 1
+    assert p["pfr_hands"] == 0
+
+
+def test_ambiguous_call_then_fold_remains_unclassified():
+    m = OpponentModel()
+    # BB is short and never acts; UTG's initial call is ambiguous.
+    late = state(teams=("hero", "small", "short_big", "caller"), button=0,
+                 bets=[0, 0, 0, 0], street="river")
+    m.new_hand()
+    m.end_hand([act(3, "call"), act(0, "raise", 80),
+                act(1, "fold"), act(3, "fold")], late, 0)
+    p = m.profile("caller")
+    assert p["preflop_opportunities"] == 0
+    assert p["vpip_hands"] == 0
+
+
+def test_later_confirmed_call_resolves_earlier_ambiguity():
+    m = OpponentModel()
+    late = state(teams=("hero", "small", "short_big", "caller"), button=0,
+                 bets=[0, 0, 0, 0], street="river")
+    m.new_hand()
+    m.end_hand([act(3, "call"), act(0, "raise", 80),
+                act(1, "fold"), act(3, "call")], late, 0)
+    p = m.profile("caller")
+    assert p["preflop_opportunities"] == 1
+    assert p["vpip_hands"] == 1
+    assert p["pfr_hands"] == 0
