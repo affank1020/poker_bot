@@ -237,3 +237,22 @@ def test_one_all_in_does_not_block_value_raise_against_active_player():
     assert state.can_raise is True
     response = _decision("AH AD", state, [shove, call])
     assert response.kind == "raise"
+
+
+def test_short_big_blind_all_in_posts_less_than_full_blind():
+    """The SB can profitably call a short BB all-in even with weak cards.
+
+    This must use all-in equity before the unopened-pot weak-hand fold
+    policy: a BB with 15 chips posts 15, below the nominal 20-chip blind.
+    """
+    state = GameState([500, 15])
+    assert state.current_bet == 15
+    assert state.big_blind == 20
+    assert state.status(1) == "all_in"
+    assert state.call_amount == 5
+    assert state.can_raise is False
+
+    action = _decision("7H 2C", state)
+    assert action.kind == "call"
+    state.process_action(action)
+    assert state.is_street_closed
