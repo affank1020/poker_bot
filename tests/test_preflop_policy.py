@@ -145,3 +145,37 @@ def test_raise_history_carries_across_our_turns_and_resets_on_seed():
 
     bot.seed(_cards("KH KD"), 0)
     assert bot.preflop_raises_seen == 0
+
+
+@pytest.mark.parametrize("hole", ["AH AD", "9H 9D"])
+def test_big_blind_calls_six_bb_short_stack_shove(hole):
+    """Regression: no folding AA/99 to a 6-BB SB shove at 25-BB BB stack."""
+    state = GameState([120, 500])
+    shove = PlayerAction.raise_to(0, 120)
+    state.process_action(shove)
+
+    assert state.to_act == 1
+    assert state.call_amount == 100
+    assert state.current_bet == 120
+    assert state.status(0) == "all_in"
+    assert state.can_raise is False
+
+    bot = Model()
+    bot.seed(_cards(hole), 1)
+    response = bot.run([shove], GameStateView(state))
+    state.validate_action(response)
+    assert response.kind == "call"
+
+    # The response is legal and actually advances the hand to showdown.
+    state.process_action(response)
+    assert state.is_street_closed
+    assert state.stacks[1] == 380
+
+
+def test_below_large_bet_threshold_all_in_still_uses_equity():
+    """We shouldn't blindly call every short shove with offsuit junk."""
+    state = GameState([120, 500])
+    shove = PlayerAction.raise_to(0, 120)
+    state.process_action(shove)
+    action = _decision("7H 2C", state, [shove])
+    assert action.kind == "fold"
