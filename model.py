@@ -5,9 +5,13 @@ non-serialisable attributes are needed at runtime.
 """
 
 import random
+from itertools import combinations
 
 from card_utils import Card, evaluate, full_deck
 from all_in_equity import expected_call_payout
+from opponent_model import OpponentModel
+from postflop_policy import decide_postflop
+from sidepot_equity import ContributionLedger
 from game_state import GameStateView
 from player_action import PlayerAction
 from preflop_policy import (
@@ -32,7 +36,11 @@ class Model:
         # Persistent data survives between hands in a match.
         self.hand = []
         self.player_id = None
-        self.opponents = {}
+        self.opponents = {}  # Legacy preflop counters; do not conflate with A1.
+        self.opponent_model = OpponentModel()
+        self.contribution_ledger = ContributionLedger()
+        self._range_cache = {}
+        self._decision_index = 0
         self.random_seed = 20261107
 
         # Hand-local observations, reset by seed().
@@ -43,6 +51,12 @@ class Model:
     def seed(self, hand: list[Card], player_id: int):
         self.hand = list(hand)
         self.player_id = player_id
+        # Keep A1 team-name records across hands, but never carry over the
+        # previous hand's public action line, ledger or range cache.
+        self.opponent_model.new_hand()
+        self.contribution_ledger.reset()
+        self._range_cache.clear()
+        self._decision_index = 0
         self.board_reveals = 0
         self.preflop_raises_seen = 0
         self.opponent_raised_street = None
@@ -269,67 +283,73 @@ class Model:
             return PlayerAction.call(self.player_id)
         return self._check_or_fold(game_state)
 
-    def _postflop(self, game_state):
-        board = list(game_state.board)
-        opponents = max(1, len(game_state.players_in_hand) - 1)
-        samples = 145 if opponents == 1 else 65
-        equity = self._equity(board, opponents, samples=samples)
-        stats = self._primary_opponent_stats(game_state)
-        cost = game_state.call_amount
-        category = evaluate(self.hand + board)[0]
+    def _opponent_ranges(self, game_state):
+        """Conservative, seat-ordered A1 combo priors; None means uniform.
 
-        # A raise by an opponent is informative. Particularly discount the
-        # uniform-hand estimate when the opponent rarely raises.
-        if cost > 0 and self.opponent_raised_street == game_state.street:
-            raises = stats.get("raises", 0)
-            other = stats.get("calls", 0) + stats.get("folds", 0)
-            if raises + other >= 4 and raises / (raises + other) < 0.25:
-                equity -= 0.12
-            else:
-                equity -= 0.04
+        A1 returns a *relative weight for a candidate hand*, not a mapping.
+        Build the mapping only for opponents with a meaningful observed
+        preflop action and at least eight completed opportunities. Reuse it
+        across later streets of this hand; the equity engine removes all
+        board and hero blockers and normalizes the residual legal combos.
+        """
+        seats = tuple(
+            seat for seat in game_state.players_in_hand
+            if seat != self.player_id
+        )
+        if not seats or len(seats) > 3:
+            return None  # Broad, cheap prior for large tables.
 
-        pot = game_state.pot  # Already includes any pending opponent bet.
-        rng = random.Random(self.random_seed)
-        self.random_seed = (self.random_seed * 1664525 + 1013904223) & 0xFFFFFFFF
-
-        if cost:
-            if equity >= 0.79 and game_state.can_raise:
-                # Pot-size calculations must include the chips we would call.
-                target = game_state.current_bet + int(0.65 * (pot + cost))
-                return self._raise(game_state, target)
-            if equity >= game_state.pot_odds + 0.045:
-                return PlayerAction.call(self.player_id)
-            return PlayerAction.fold(self.player_id)
-
-        # When checking is free, value-bet credible made hands, and use a
-        # small amount of randomised aggression rather than always checking.
-        if game_state.can_raise:
-            if equity >= 0.73 and (category >= 1 or equity >= 0.90):
-                target = game_state.bets[self.player_id] + round(0.6 * pot)
-                return self._raise(game_state, target)
-            if equity >= 0.59 and category >= 1 and rng.random() < 0.30:
-                target = game_state.bets[self.player_id] + round(0.4 * pot)
-                return self._raise(game_state, target)
-            folds = stats.get("folds", 0)
-            observations = folds + stats.get("calls", 0) + stats.get("raises", 0)
+        ranges = []
+        for seat in seats:
+            team = game_state.teams[seat]
+            line = self.opponent_model.hand_line(team).get("preflop", ())
+            action = ("raise" if "raise" in line else
+                      "call" if "call" in line else None)
             if (
-                opponents == 1
-                and category == 0
-                and 0.25 < equity < 0.50
-                and observations >= 8
-                and folds / observations > 0.45
-                and rng.random() < 0.15
+                action is None
+                or self.opponent_model.profile(team)["preflop_opportunities"] < 8
             ):
-                return self._raise(
-                    game_state, game_state.bets[self.player_id] + round(0.5 * pot)
-                )
-        return PlayerAction.call(self.player_id)
+                ranges.append(None)
+                continue
+
+            key = (team, action)
+            weights = self._range_cache.get(key)
+            if weights is None:
+                deck = [card for card in full_deck() if card not in self.hand]
+                weights = {}
+                for hand in combinations(deck, 2):
+                    relative = self.opponent_model.preflop_range_weight(
+                        team, hand, action=action
+                    )
+                    # Half uniform plus half of A1's broad prior; do not
+                    # overfit a small sample of public action observations.
+                    weights[hand] = 0.5 + 0.5 * relative
+                self._range_cache[key] = weights
+            ranges.append(weights)
+        return tuple(ranges) if any(r is not None for r in ranges) else None
 
     def run(self, actions: list[PlayerAction], game_state: GameStateView) -> PlayerAction:
+        # The organiser delivers incremental public events. Feed this batch
+        # exactly once to A1; legacy counters are retained for preflop.
         self._observe(actions, game_state)
+        self.opponent_model.observe(actions, game_state, self.player_id)
+        contributions = self.contribution_ledger.observe(game_state)
         if game_state.street == "preflop":
             return self._preflop(game_state)
-        return self._postflop(game_state)
+
+        self._decision_index += 1
+        self.random_seed = (self.random_seed * 1664525 + 1013904223) & 0xFFFFFFFF
+        decision_seed = self.random_seed ^ (self._decision_index * 0x9E3779B9)
+        return decide_postflop(
+            self.hand, self.player_id, game_state,
+            ranges=self._opponent_ranges(game_state),
+            seed=decision_seed,
+            facing_aggression=self.opponent_raised_street == game_state.street,
+            contributions=contributions,
+        )
 
     def end_game(self, actions: list[PlayerAction], game_state: GameStateView):
         self._observe(actions, game_state)
+        # Final incremental events can contain both last-street bets and
+        # public showdown hole-card reveals; A1 records these by team.
+        self.opponent_model.end_hand(actions, game_state, self.player_id)
