@@ -185,19 +185,29 @@ class Model:
         ):
             return self._raise(game_state, game_state.max_raise_to)
 
-        # An opponent who has shoved is already all-in: with no further
-        # betting against them, choose call/fold using showdown equity and
-        # pot odds. Ordinary open-defence size caps do NOT apply here.
-        # This also covers short unequal stacks where cost is below the
-        # generic "large bet" threshold (e.g. BB facing a 6-BB SB shove).
-        if heads_up and cost > 0 and any(
-            game_state.status(player) == "all_in"
-            for player in game_state.players_in_hand
+        # All-in defence is about whether MORE betting remains possible,
+        # not the number of seats originally at the table. An all-in player
+        # can coexist with active players, so inspect every surviving
+        # opponent. With all opponents already all-in there is no further
+        # betting; ordinary open/3-bet calling caps must not fold premiums.
+        remaining_opponents = [
+            player for player in game_state.players_in_hand
             if player != self.player_id
+        ]
+        if (
+            cost > 0
+            and remaining_opponents
+            and all(
+                game_state.status(player) == "all_in"
+                for player in remaining_opponents
+            )
         ):
-            equity = self._equity([], 1, samples=240)
-            # Small effective stacks justify somewhat wider calls; avoid
-            # treating this as evidence for a uniform opponent range.
+            # Multiway equity includes EVERY remaining hand, not only the
+            # last player to shove. Calling is the only non-fold option.
+            equity = self._equity(
+                [], len(remaining_opponents),
+                samples=240 if len(remaining_opponents) == 1 else 180,
+            )
             margin = 0.035 if current <= 11 * bb else 0.075
             if equity >= game_state.pot_odds + margin:
                 return PlayerAction.call(self.player_id)
