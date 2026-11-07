@@ -256,3 +256,55 @@ def test_short_big_blind_all_in_posts_less_than_full_blind():
     assert action.kind == "call"
     state.process_action(action)
     assert state.is_street_closed
+
+
+@pytest.mark.parametrize("hole", ["AH AD", "9H 9D"])
+def test_hero_short_all_in_call_with_other_opponent_still_active(hole):
+    """Sev2: AA/99 must not fold a final 10 chips after shove and call."""
+    state = GameState([120, 500, 30])
+    shove = PlayerAction.raise_to(0, 120)
+    caller = PlayerAction.call(1)
+    state.process_action(shove)
+    state.process_action(caller)
+
+    assert state.bets == [120, 120, 20]
+    assert state.stacks == [0, 380, 10]
+    assert state.to_act == 2
+    assert state.call_amount == 10
+    assert state.can_raise is False
+    assert state.status(0) == "all_in"
+    assert state.status(1) == "active"
+
+    action = _decision(hole, state, [shove, caller])
+    state.validate_action(action)
+    assert action.kind == "call"
+    state.process_action(action)
+    assert state.stacks[2] == 0
+
+
+def test_hero_short_call_checks_value_not_merely_all_in_status():
+    """A more expensive all-in call can still be unprofitable with 72o."""
+    state = GameState([120, 500, 120])
+    shove = PlayerAction.raise_to(0, 120)
+    caller = PlayerAction.call(1)
+    state.process_action(shove)
+    state.process_action(caller)
+
+    assert state.to_act == 2
+    assert state.call_amount == state.stacks[2] == 100
+    assert state.status(1) == "active"
+    action = _decision("7H 2C", state, [shove, caller])
+    state.validate_action(action)
+    assert action.kind == "fold"
+
+
+def test_cheap_all_in_call_with_weak_hand_can_be_positive_ev():
+    """With 10 chips to call into 260, no unconditional junk-hand fold."""
+    state = GameState([120, 500, 30])
+    shove = PlayerAction.raise_to(0, 120)
+    caller = PlayerAction.call(1)
+    state.process_action(shove)
+    state.process_action(caller)
+    action = _decision("7H 2C", state, [shove, caller])
+    state.validate_action(action)
+    assert action.kind == "call"
