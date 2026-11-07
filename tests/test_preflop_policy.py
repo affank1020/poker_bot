@@ -89,3 +89,59 @@ def test_multiway_uses_tighter_range():
     action = _decision("AH AD", state)
     assert action.kind == "raise"
     assert action.amount == 60
+
+
+def test_six_big_blind_first_open_is_not_mistaken_for_three_bet():
+    """AJs should value-reraise the first opener, even when it is large."""
+    state = GameState([500, 500])
+    opener = PlayerAction.raise_to(0, 120)
+    state.process_action(opener)
+    action = _decision("AH JH", state, [opener])
+    assert (action.kind, action.amount) == ("raise", 336)
+
+
+def test_small_real_three_bet_uses_three_bet_defence_range():
+    """A 4-BB three-bet is still a three-bet, even below 5.5 BB."""
+    state = GameState([500, 500])
+    opener = PlayerAction.raise_to(0, 40)
+    three_bet = PlayerAction.raise_to(1, 80)
+    state.process_action(opener)
+    state.process_action(three_bet)
+    action = _decision("AH JH", state, [opener, three_bet])
+    assert action.kind == "fold"
+
+
+@pytest.mark.parametrize("three_bet_total", [180, 200])
+def test_premium_four_bet_shove_precedes_large_bet_guard(three_bet_total):
+    """AA must jam over either a 9-BB or 10-BB actual three-bet."""
+    state = GameState([500, 500])
+    opener = PlayerAction.raise_to(0, 46)
+    three_bet = PlayerAction.raise_to(1, three_bet_total)
+    state.process_action(opener)
+    state.process_action(three_bet)
+    action = _decision("AH AD", state, [opener, three_bet])
+    assert (action.kind, action.amount) == ("raise", 500)
+
+
+def test_raise_history_carries_across_our_turns_and_resets_on_seed():
+    bot = Model()
+    state = GameState([500, 500])
+    bot.seed(_cards("AH AD"), 0)
+
+    first_action = bot.run([], GameStateView(state))
+    assert first_action.kind == "raise"
+    state.process_action(first_action)
+
+    opponent_three_bet = PlayerAction.raise_to(1, 200)
+    state.process_action(opponent_three_bet)
+
+    # The engine replays our previous action as well as the opponent's.
+    second_action = bot.run(
+        [first_action, opponent_three_bet], GameStateView(state)
+    )
+    state.validate_action(second_action)
+    assert (second_action.kind, second_action.amount) == ("raise", 500)
+    assert bot.preflop_raises_seen == 2
+
+    bot.seed(_cards("KH KD"), 0)
+    assert bot.preflop_raises_seen == 0
