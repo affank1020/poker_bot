@@ -31,6 +31,7 @@ def _street_counts():
         "actions": 0,
         "unopened_opportunities": 0,
         "bets_unopened": 0,
+        "limps": 0,  # Preflop calls before a raise that cost chips.
         "checks": 0,
         "facing_bet": 0,
         "fold_to_bet": 0,
@@ -115,7 +116,7 @@ class OpponentModel:
         self._last_completed = None
         self._closed = False
 
-    def _start_hand(self, game_state, hero_id):
+    def _start_hand(self, game_state, hero_id, actions):
         if self._hand is not None:
             if self._hand["hero_id"] != hero_id:
                 raise ValueError("new_hand() must be called when seat changes")
@@ -126,9 +127,36 @@ class OpponentModel:
         button = game_state.button
         small = button if len(names) == 2 else (button + 1) % len(names)
         big = (small + 1) % len(names)
+        # Blind posts are min(blind, starting stack). They are NOT emitted
+        # in the action stream, so never assume nominal amounts when the
+        # blind could have been posted all-in for less. On the first observe
+        # call, `actions` is the whole stream before our first decision. If a
+        # blind has already acted, they could not have started all-in and
+        # hence posted the full blind. Otherwise, when still on preflop the
+        # public view contains their untouched actual initial street bet.
+        first_street_actors = set()
+        board_count = 0
+        for action in actions:
+            if action.kind == "reveal_card" and action.player_id == -1:
+                board_count += 1
+                if board_count == 3:
+                    break
+            elif action.kind in ("fold", "call", "raise"):
+                first_street_actors.add(action.player_id)
+
         invested = [0] * len(names)
-        invested[small] = game_state.small_blind
-        invested[big] = game_state.big_blind
+        for seat, nominal in ((small, game_state.small_blind),
+                              (big, game_state.big_blind)):
+            if seat in first_street_actors:
+                invested[seat] = nominal
+            elif game_state.street == "preflop":
+                invested[seat] = min(nominal, game_state.bets[seat])
+            else:
+                # Cannot recover an unacted, potentially short blind from
+                # a postflop snapshot. Unknown cost is not a free check.
+                invested[seat] = None
+        initial_bet = (max(invested) if all(bet is not None for bet in invested)
+                       else None)
         for i, name in enumerate(names):
             if i != hero_id:
                 self._records.setdefault(name, _blank_record())
@@ -138,7 +166,7 @@ class OpponentModel:
             "street": "preflop",
             "board_reveals": 0,
             "bets": invested,
-            "current_bet": game_state.big_blind,
+            "current_bet": initial_bet,
             "preflop_raises": 0,
             "preflop_acted": set(),
             "vpip": set(),
@@ -153,7 +181,7 @@ class OpponentModel:
         """Consume exactly one incremental action batch (no secret data)."""
         if self._closed:
             raise ValueError("new_hand() required after end_hand()")
-        self._start_hand(game_state, hero_id)
+        self._start_hand(game_state, hero_id, actions)
         hand = self._hand
         if batch_id is not None:
             if batch_id in hand["seen_batches"]:
@@ -183,10 +211,13 @@ class OpponentModel:
 
             street = hand["street"]
             old_bet = hand["bets"][pid]
-            cost = max(0, hand["current_bet"] - old_bet)
-            # Preflop posting the SB is not a bet by an opponent. An SB limp
-            # is voluntary participation, but not a 'call facing aggression'.
-            facing = cost > 0 and (street != "preflop" or hand["preflop_raises"] > 0)
+            current_bet = hand["current_bet"]
+            cost = (max(0, current_bet - old_bet)
+                    if current_bet is not None and old_bet is not None else None)
+            # A preflop SB completion faces the forced BB, not aggression.
+            # An unknown blind cost must not be mistaken for a free check.
+            unraised = street == "preflop" and hand["preflop_raises"] == 0
+            facing = (cost is not None and cost > 0 and not unraised)
             name = hand["teams"][pid]
             if pid != hero_id:
                 record = self._records[name]
@@ -195,7 +226,7 @@ class OpponentModel:
                 hand["lines"][name][street].append(action.kind)
                 if street == "preflop":
                     hand["preflop_acted"].add(name)
-                    if action.kind == "raise" or (action.kind == "call" and cost > 0):
+                    if action.kind == "raise" or (action.kind == "call" and cost is not None and cost > 0):
                         hand["vpip"].add(name)
                     if action.kind == "raise":
                         hand["pfr"].add(name)
@@ -211,12 +242,17 @@ class OpponentModel:
                         counts["call_facing_bet"] += 1
                     else:
                         counts["raise_facing_bet"] += 1
-                elif cost == 0:
+                elif unraised or cost == 0:
+                    # Include SB/button open/limp decisions even though the
+                    # small blind still owes the forced BB difference. They
+                    # are unopened pots until the first *voluntary* raise.
                     counts["unopened_opportunities"] += 1
-                    if action.kind == "call":
-                        counts["checks"] += 1
-                    elif action.kind == "raise":
+                    if action.kind == "raise":
                         counts["bets_unopened"] += 1
+                    elif action.kind == "call" and cost == 0:
+                        counts["checks"] += 1
+                    elif action.kind == "call" and cost is not None and cost > 0:
+                        counts["limps"] += 1
                 if action.kind == "raise":
                     counts["raises"] += 1
                     if action.amount >= 8 * game_state.big_blind:
@@ -226,11 +262,13 @@ class OpponentModel:
             # actions, never from the final GameStateView.bets snapshot.
             if action.kind == "raise":
                 hand["bets"][pid] = action.amount
-                hand["current_bet"] = max(hand["current_bet"], action.amount)
+                hand["current_bet"] = action.amount
                 if street == "preflop":
                     hand["preflop_raises"] += 1  # hero raises count too
             elif action.kind == "call":
-                hand["bets"][pid] = max(old_bet, hand["current_bet"])
+                hand["bets"][pid] = (max(old_bet, hand["current_bet"])
+                                     if old_bet is not None and hand["current_bet"] is not None
+                                     else None)
             # Fold does not change current_bet.
 
     def end_hand(self, actions, game_state, hero_id, batch_id=None):
