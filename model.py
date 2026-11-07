@@ -36,12 +36,14 @@ class Model:
 
         # Hand-local observations, reset by seed().
         self.board_reveals = 0
+        self.preflop_raises_seen = 0
         self.opponent_raised_street = None
 
     def seed(self, hand: list[Card], player_id: int):
         self.hand = list(hand)
         self.player_id = player_id
         self.board_reveals = 0
+        self.preflop_raises_seen = 0
         self.opponent_raised_street = None
         self.random_seed = (self.random_seed * 1664525 + 1013904223) & 0xFFFFFFFF
 
@@ -51,6 +53,10 @@ class Model:
             if action.kind == "reveal_card" and action.player_id == -1:
                 self.board_reveals += 1
                 continue
+            # An action stream spans turns. Count every preflop raise,
+            # including our own, before ignoring our actions for stats.
+            if action.kind == "raise" and self.board_reveals == 0:
+                self.preflop_raises_seen += 1
             if action.player_id == self.player_id or action.player_id < 0:
                 continue
             if action.kind not in ("fold", "call", "raise"):
@@ -165,6 +171,20 @@ class Model:
                 return PlayerAction.call(self.player_id)
             return self._check_or_fold(game_state)
 
+        # Distinguish an opening raise from a 3-bet by the actual betting
+        # sequence, never by its size: a 6-BB first open is still an open.
+        facing_reraise = self.preflop_raises_seen >= 2
+
+        # Premium 4-bets take precedence over the general large-bet guard;
+        # otherwise a 10-BB 3-bet would force AA to call instead of jam.
+        if (
+            heads_up
+            and facing_reraise
+            and hand in HU_FOUR_BET_SHOVE
+            and game_state.can_raise
+        ):
+            return self._raise(game_state, game_state.max_raise_to)
+
         # Preserve the v1 showdown-equity guard against very large raises
         # and shoves. Dedicated opponent ranges are planned for the next PR.
         if cost >= max(4 * bb, int(0.30 * (stack + game_state.bets[self.player_id]))):
@@ -180,11 +200,9 @@ class Model:
                 return PlayerAction.call(self.player_id)
             return PlayerAction.fold(self.player_id)
 
-        # A raise to 5.5+ BB is commonly a 3-bet at normal stack depths.
-        # Do not call cheaply with weak drawing hands at 25 BB.
-        if current >= 5.5 * bb:
-            if heads_up and hand in HU_FOUR_BET_SHOVE and game_state.can_raise:
-                return self._raise(game_state, game_state.max_raise_to)
+        # A genuine 3-bet (or later raise) deserves a stronger defend range.
+        # Size limits are handled separately, without inferring action count.
+        if facing_reraise:
             defend = HU_VS_THREE_BET if heads_up else MULTI_THREE_BET
             if hand in defend and cost <= 7 * bb and cost <= 0.37 * stack:
                 return PlayerAction.call(self.player_id)
