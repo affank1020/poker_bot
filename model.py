@@ -185,6 +185,24 @@ class Model:
         ):
             return self._raise(game_state, game_state.max_raise_to)
 
+        # An opponent who has shoved is already all-in: with no further
+        # betting against them, choose call/fold using showdown equity and
+        # pot odds. Ordinary open-defence size caps do NOT apply here.
+        # This also covers short unequal stacks where cost is below the
+        # generic "large bet" threshold (e.g. BB facing a 6-BB SB shove).
+        if heads_up and cost > 0 and any(
+            game_state.status(player) == "all_in"
+            for player in game_state.players_in_hand
+            if player != self.player_id
+        ):
+            equity = self._equity([], 1, samples=240)
+            # Small effective stacks justify somewhat wider calls; avoid
+            # treating this as evidence for a uniform opponent range.
+            margin = 0.035 if current <= 11 * bb else 0.075
+            if equity >= game_state.pot_odds + margin:
+                return PlayerAction.call(self.player_id)
+            return PlayerAction.fold(self.player_id)
+
         # Preserve the v1 showdown-equity guard against very large raises
         # and shoves. Dedicated opponent ranges are planned for the next PR.
         if cost >= max(4 * bb, int(0.30 * (stack + game_state.bets[self.player_id]))):
