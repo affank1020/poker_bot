@@ -42,8 +42,15 @@ def shown(pid, text):
     return act(pid, "reveal_card", card=cards(text)[0])
 
 
-def state(teams=("hero", "villain"), button=0, sb=10, bb=20):
-    return SimpleNamespace(teams=teams, button=button, small_blind=sb, big_blind=bb)
+def state(teams=("hero", "villain"), button=0, sb=10, bb=20,
+          bets=None, street="preflop"):
+    if bets is None:
+        bets = [0] * len(teams)
+        small = button if len(teams) == 2 else (button + 1) % len(teams)
+        big = (small + 1) % len(teams)
+        bets[small], bets[big] = sb, bb
+    return SimpleNamespace(teams=teams, button=button, small_blind=sb,
+                           big_blind=bb, bets=tuple(bets), street=street)
 
 
 def test_unknown_opponent_has_smoothed_rates_and_no_memory():
@@ -259,3 +266,71 @@ def test_duplicate_end_hand_does_not_recount_and_new_hand_empties_line():
     assert m.hand_line("villain") == {}
     m.end_hand([act(1, "fold")], state(button=1), 0)
     assert m.profile("villain")["hands_seen"] == 2
+
+
+def test_heads_up_small_blind_open_and_limp_are_unraised_opportunities():
+    m = OpponentModel()
+    # Alternating button over many hands: villain opens on their SB/button,
+    # checks on their BB when hero limps. These are distinct legal actions.
+    for _ in range(12):
+        m.new_hand()
+        m.end_hand([act(1, "raise", 50), act(0, "fold")], state(button=1), 0)
+        m.new_hand()
+        m.end_hand([act(0, "call"), act(1, "call")], state(button=0), 0)
+    p = m.profile("villain")
+    c = p["streets"]["preflop"]
+    assert c["unopened_opportunities"] == 24
+    assert c["bets_unopened"] == 12
+    assert c["checks"] == 12
+    assert c["limps"] == 0
+    assert c["rates"]["bet_unopened"] > 0.45
+
+    m.new_hand()
+    m.end_hand([act(1, "call"), act(0, "call")], state(button=1), 0)
+    c = m.profile("villain")["streets"]["preflop"]
+    assert c["limps"] == 1
+    assert c["checks"] == 12  # SB completion costs chips, not a check.
+    assert c["unopened_opportunities"] == 25
+
+
+def test_short_all_in_big_blind_does_not_turn_sb_check_into_vpip():
+    # Organiser's actual setup is [0,10,5], not nominal [0,10,20].
+    s = state(teams=("hero", "small", "short_big"), button=0, bets=[0, 10, 5])
+    m = OpponentModel()
+    m.new_hand()
+    m.observe([], s, 0)  # initial public state before hero acts
+    m.end_hand([act(0, "call"), act(1, "call")], s, 0)
+    p = m.profile("small")
+    assert p["preflop_opportunities"] == 1
+    assert p["vpip_hands"] == 0
+    assert p["streets"]["preflop"]["checks"] == 1
+    assert p["streets"]["preflop"]["limps"] == 0
+    assert p["streets"]["preflop"]["call_facing_bet"] == 0
+    assert m.profile("short_big")["preflop_opportunities"] == 0
+
+
+def test_short_all_in_small_blind_never_fakes_full_investment():
+    s = state(teams=("hero", "short_small", "big"), button=0,
+              bets=[0, 5, 20])
+    m = OpponentModel()
+    m.new_hand()
+    m.observe([], s, 0)
+    assert m._hand["bets"] == [0, 5, 20]
+    m.end_hand([act(0, "call"), act(2, "call")], s, 0)
+    assert m.profile("short_small")["vpip_hands"] == 0
+    assert m.profile("big")["streets"]["preflop"]["checks"] == 1
+
+
+def test_unknown_blind_post_after_street_change_not_a_false_check_or_vpip():
+    # We cannot reconstruct initial short blind posts from a river view when
+    # no earlier observation occurred. Unknown cost is excluded safely.
+    m = OpponentModel()
+    m.new_hand()
+    river = state(teams=("hero", "small", "big"), button=0,
+                  bets=[0, 0, 0], street="river")
+    m.end_hand([act(0, "call"), act(1, "call"),
+                reveal("2C"), reveal("7D"), reveal("9H")], river, 0)
+    p = m.profile("small")
+    assert p["vpip_hands"] == 0  # Unknown forced-blind difference.
+    assert p["streets"]["preflop"]["checks"] == 0
+    assert p["streets"]["preflop"]["limps"] == 0
