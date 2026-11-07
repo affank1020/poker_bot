@@ -5,7 +5,7 @@ import pytest
 
 from card_utils import Card
 from equity_engine import EquityResult
-from postflop_policy import _draw_potential, decide_postflop
+from postflop_policy import _contestable_pot, _draw_potential, decide_postflop
 
 
 def cards(text):
@@ -106,7 +106,7 @@ def test_multiway_actions_are_legal_and_restrained():
 def test_call_thresholds_use_correct_pot_odds(monkeypatch):
     monkeypatch.setattr(
         "postflop_policy.estimate_equity",
-        lambda *a, **k: EquityResult(0.41, 0.41, 0, 10, False)
+        lambda *a, **k: EquityResult(0.41, 0.41, 0, 120, False)
     )
     view = View(
         street="flop", board=cards("2S 7D JC"), pot=120,
@@ -123,7 +123,7 @@ def test_call_thresholds_use_correct_pot_odds(monkeypatch):
 def test_aggression_gate_makes_marginal_call_more_cautious(monkeypatch):
     monkeypatch.setattr(
         "postflop_policy.estimate_equity",
-        lambda *a, **k: EquityResult(0.31, 0.31, 0, 10, False)
+        lambda *a, **k: EquityResult(0.31, 0.31, 0, 120, False)
     )
     view = View(
         street="flop", board=cards("2S 7D JC"), pot=120,
@@ -149,3 +149,141 @@ def test_deterministic_seed_and_sample_budget():
         cards("AS KS"), 0, view, seed=115, samples=40
     )
     assert view.validate(first).kind in ("fold", "call", "raise")
+
+
+def test_short_stack_uncallable_overbet_is_not_counted_in_pot_odds(monkeypatch):
+    monkeypatch.setattr(
+        "postflop_policy.estimate_equity",
+        lambda *a, **kw: EquityResult(0.07, 0.07, 0.0, 120, False),
+    )
+    # 40 from preflop, 500 opponent flop bet, hero has 5 remaining.
+    view = View(
+        street="flop", board=cards("2S 7D JC"), pot=540,
+        call_amount=5, current_bet=500, can_raise=False,
+        raise_range=None, bets=(0, 500), stacks=(5, 480),
+    )
+    assert _contestable_pot(view, 0, 5) == 45
+    # Only 50 chips are in the pot the hero could win by calling.
+    assert 5 / (_contestable_pot(view, 0, 5) + 5) == 0.1
+    assert decide_postflop(cards("AS KS"), 0, view, seed=1).kind == "fold"
+
+
+def test_multiway_uncallable_side_pot_bets_removed_from_pot_odds(monkeypatch):
+    monkeypatch.setattr(
+        "postflop_policy.estimate_equity",
+        lambda *a, **kw: EquityResult(0.04, 0.04, 0.0, 65, False),
+    )
+    # 60 previous pot; two opponents bet/call 300; hero has 5 left.
+    view = View(
+        street="turn", board=cards("2S 7D JC QH"), pot=660,
+        call_amount=5, current_bet=300, can_raise=False,
+        raise_range=None, players_in_hand=(0, 1, 2),
+        bets=(0, 300, 300), stacks=(5, 500, 500),
+    )
+    assert _contestable_pot(view, 0, 5) == 70
+    assert decide_postflop(cards("AS KS"), 0, view, seed=1).kind == "fold"
+
+
+def test_low_trial_conditioned_equity_falls_back_to_uniform(monkeypatch):
+    seen = []
+
+    def fake_equity(*args, **kw):
+        seen.append(kw.get("ranges"))
+        if kw.get("ranges") is not None:
+            return EquityResult(1.0, 1.0, 0.0, 1, False)
+        return EquityResult(0.20, 0.20, 0.0, 65, False)
+
+    monkeypatch.setattr("postflop_policy.estimate_equity", fake_equity)
+    view = View(
+        street="turn", board=cards("2S 7D JC QH"),
+        players_in_hand=(0, 1, 2), bets=(0, 0, 0),
+        stacks=(400, 400, 400),
+    )
+    narrow = {cards("KC KD"): 1.0}
+    action = decide_postflop(
+        cards("AS KS"), 0, view, ranges=[narrow, narrow], seed=7,
+    )
+    assert seen == [[narrow, narrow], None]
+    assert view.validate(action).kind == "call"  # Check, not a fake-equity bet.
+
+
+def test_no_reliable_trial_estimate_falls_back_to_safe_action(monkeypatch):
+    monkeypatch.setattr(
+        "postflop_policy.estimate_equity",
+        lambda *a, **kw: EquityResult(1.0, 1.0, 0.0, 1, False),
+    )
+    view = View(street="turn", board=cards("2S 7D JC QH"))
+    assert decide_postflop(cards("AS KS"), 0, view, seed=7).kind == "call"
+    view.call_amount = 40
+    assert decide_postflop(cards("AS KS"), 0, view, seed=7).kind == "fold"
+
+
+def test_default_seed_changes_semibluff_choices_but_explicit_seed_is_stable(monkeypatch):
+    monkeypatch.setattr(
+        "postflop_policy.estimate_equity",
+        lambda *a, **kw: EquityResult(0.45, 0.45, 0.0, 120, False),
+    )
+    view = View(street="flop", board=cards("2S 7S JC"))
+    hero = cards("AS KS")
+    assert decide_postflop(hero, 0, view, seed=2) == decide_postflop(
+        hero, 0, view, seed=2
+    )
+    sampled_seeds = iter(range(200))
+    monkeypatch.setattr(
+        "postflop_policy.random.getrandbits", lambda _: next(sampled_seeds)
+    )
+    kinds = [decide_postflop(hero, 0, view).kind for _ in range(200)]
+    assert 15 <= kinds.count("raise") <= 60
+    assert kinds.count("call") + kinds.count("raise") == 200
+
+
+def test_actual_game_state_allin_short_call_regression(monkeypatch):
+    from game_state import GameState, GameStateView
+    from player_action import PlayerAction
+
+    state = GameState(stacks=[25, 1000])
+    state.process_action(PlayerAction.call(0))
+    state.process_action(PlayerAction.call(1))  # BB check
+    for card in cards("2S 7D JC"):
+        state.deal_card(card)
+    assert state.to_act == 1 and state.street == "flop"
+    state.process_action(PlayerAction.raise_to(1, 500))
+    view = GameStateView(state)
+    assert view.to_act == 0 and view.call_amount == 5
+    assert view.pot == 540 and tuple(view.bets) == (0, 500)
+    assert _contestable_pot(view, 0, view.call_amount) == 45
+    monkeypatch.setattr(
+        "postflop_policy.estimate_equity",
+        lambda *a, **kw: EquityResult(0.07, 0.07, 0.0, 120, False),
+    )
+    action = decide_postflop(cards("AS KS"), 0, view, seed=10)
+    assert action.kind == "fold"
+    state.validate_action(action)
+
+
+def test_actual_game_state_multiway_side_pot_regression(monkeypatch):
+    from game_state import GameState, GameStateView
+    from player_action import PlayerAction
+
+    state = GameState(stacks=[25, 1000, 1000])
+    assert state.to_act == 0
+    state.process_action(PlayerAction.call(0))
+    state.process_action(PlayerAction.call(1))
+    state.process_action(PlayerAction.call(2))
+    assert state.is_street_closed
+    for card in cards("2S 7D JC"):
+        state.deal_card(card)
+    assert state.to_act == 1
+    state.process_action(PlayerAction.raise_to(1, 300))
+    state.process_action(PlayerAction.call(2))
+    view = GameStateView(state)
+    assert view.to_act == 0 and view.call_amount == 5
+    assert view.pot == 660 and tuple(view.bets) == (0, 300, 300)
+    assert _contestable_pot(view, 0, view.call_amount) == 70
+    monkeypatch.setattr(
+        "postflop_policy.estimate_equity",
+        lambda *a, **kw: EquityResult(0.04, 0.04, 0.0, 65, False),
+    )
+    action = decide_postflop(cards("AS KS"), 0, view, seed=10)
+    assert action.kind == "fold"
+    state.validate_action(action)
