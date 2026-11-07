@@ -287,3 +287,108 @@ def test_actual_game_state_multiway_side_pot_regression(monkeypatch):
     action = decide_postflop(cards("AS KS"), 0, view, seed=10)
     assert action.kind == "fold"
     state.validate_action(action)
+
+
+def test_river_allin_side_pot_hero_wins_deep_player():
+    """Reviewer regression: hero loses main to A, wins side pot vs B."""
+    from sidepot_equity import estimate_call_payout
+
+    board = cards("2H 3D 4C 5S 9H")
+    hero = cards("AH 7C")  # 5-high straight.
+    a = {cards("6H 8S"): 1}  # All-in 6-high straight.
+    b = {cards("KC QD"): 1}  # Deep player has high card.
+    view = View(
+        street="river", board=board, pot=370, call_amount=100,
+        current_bet=100, can_raise=False, raise_range=None,
+        players_in_hand=(0, 1, 2), bets=(0, 0, 100),
+        stacks=(200, 0, 200),
+    )
+    ledger = (120, 30, 220)
+    result = estimate_call_payout(
+        hero, board, 0, contributions=ledger,
+        folded=(False, False, False), opponents=(1, 2),
+        call_cost=100, button=0, ranges=[a, b],
+    )
+    assert result.exact and result.trials == 1
+    assert result.eligible_pot == 470
+    assert result.expected_chips == 380  # 90 main to A; 380 side to hero.
+    action = decide_postflop(
+        hero, 0, view, ranges=[a, b], contributions=ledger, seed=31
+    )
+    assert view.validate(action).kind == "call"
+
+
+def test_river_allin_side_pot_hero_loses_both_tiers():
+    from sidepot_equity import estimate_call_payout
+
+    board = cards("2H 3D 4C 5S 9H")
+    hero = cards("AH 7C")
+    a = {cards("6H 8S"): 1}
+    b = {cards("6C 8D"): 1}
+    view = View(
+        street="river", board=board, pot=370, call_amount=100,
+        current_bet=100, can_raise=False, raise_range=None,
+        players_in_hand=(0, 1, 2), bets=(0, 0, 100),
+        stacks=(200, 0, 200),
+    )
+    ledger = (120, 30, 220)
+    result = estimate_call_payout(
+        hero, board, 0, contributions=ledger,
+        folded=(False, False, False), opponents=(1, 2),
+        call_cost=100, button=0, ranges=[a, b],
+    )
+    assert result.expected_chips == 0
+    assert decide_postflop(
+        hero, 0, view, ranges=[a, b], contributions=ledger, seed=31
+    ).kind == "fold"
+
+
+def test_side_pot_payout_matches_organiser_engine():
+    engine = pytest.importorskip("engine")
+    from sidepot_equity import estimate_call_payout
+    board = cards("2H 3D 4C 5S 9H")
+    hero = cards("AH 7C")
+    a = cards("6H 8S")
+    b = cards("KC QD")
+    folded_cards = cards("JD TD")
+    prior = (120, 30, 220, 40)  # Fourth seat folded but paid 40.
+    after_call = [220, 30, 220, 40]
+    result = estimate_call_payout(
+        hero, board, 0, contributions=prior,
+        folded=(False, False, False, True), opponents=(1, 2),
+        call_cost=100, button=0, ranges=[{a: 1}, {b: 1}]
+    )
+    organiser = engine.payouts(
+        after_call, [False, False, False, True],
+        [list(hero), list(a), list(b), list(folded_cards)],
+        list(board), button=0,
+    )
+    assert result.exact
+    assert result.expected_chips == organiser[0] == 390
+
+
+def test_side_pot_uniform_mc_is_bounded_and_seed_reproducible():
+    from sidepot_equity import estimate_call_payout
+    args = dict(
+        hero=cards("AH 7C"), board=cards("2H 3D 4C 5S"),
+        hero_id=0, contributions=(120, 30, 220),
+        folded=(False, False, False), opponents=(1, 2),
+        call_cost=100, button=0, samples=20, seed=5
+    )
+    x = estimate_call_payout(**args)
+    assert x == estimate_call_payout(**args)
+    assert not x.exact and x.trials == 20
+    assert 0 <= x.expected_chips <= x.eligible_pot
+
+
+def test_bad_sidepot_ledger_folds_safely_without_payout_estimation():
+    board = cards("2H 3D 4C 5S 9H")
+    view = View(
+        street="river", board=board, pot=370, call_amount=100,
+        current_bet=100, can_raise=False, raise_range=None,
+        players_in_hand=(0, 1, 2), bets=(0, 0, 100),
+        stacks=(200, 0, 200)
+    )
+    assert decide_postflop(
+        cards("AH 7C"), 0, view, contributions=(120, 30, 100), seed=2
+    ).kind == "fold"
