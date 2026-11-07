@@ -25,6 +25,40 @@ from equity_engine import (
 _ATTEMPTS_PER_SAMPLE = 24
 
 
+class ContributionLedger:
+    """Pickle-safe hand-local reconstruction from observed public stacks.
+
+    At the *first preflop view*, all chips spent in this hand are in
+    view.bets, hence starting_stack = stack_remaining + street_bet.
+    Later, starting_stack - current_stack is an exact per-seat cumulative
+    commitment, including completed streets and folded players. Reset in
+    Model.seed(). If first observed on a later street, return None instead
+    of guessing historical contributions.
+    """
+
+    def __init__(self):
+        self.initial = None
+
+    def reset(self):
+        self.initial = None
+
+    def observe(self, view):
+        if self.initial is None:
+            if view.street != "preflop":
+                return None
+            self.initial = tuple(
+                stack + bet for stack, bet in zip(view.stacks, view.bets)
+            )
+        if len(self.initial) != len(view.stacks):
+            return None
+        commitments = tuple(
+            initial - stack for initial, stack in zip(self.initial, view.stacks)
+        )
+        if any(chips < 0 for chips in commitments) or sum(commitments) != view.pot:
+            return None
+        return commitments
+
+
 @dataclass(frozen=True)
 class PayoutEstimate:
     expected_chips: float
