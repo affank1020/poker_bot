@@ -21,7 +21,7 @@ modified by the benchmark.
   `arena.match.play_match` and `evals.score.score`. Every deck is played
   under both heads-up seat rotations. The same seeds/deck indices are used
   on both checkouts. The harness **refuses** a paired comparison if evaluation
-  engine, dummies, worker or scoring source files differ between checkouts.
+  engine, player factory, game interface, dummies, worker, package entrypoint or scoring source files differ between checkouts.
 
 These are **separate V1-vs-dummy and candidate-vs-dummy evaluations**, not a
 direct V1-vs-V2 head-to-head game. Card deals are paired; the action paths,
