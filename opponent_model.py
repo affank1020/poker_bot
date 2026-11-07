@@ -50,6 +50,8 @@ def _blank_record():
         "pfr_hands": 0,
         "three_bet_opportunities": 0,
         "three_bets": 0,
+        "hu_bb_open_opportunities": 0,
+        "hu_bb_open_folds": 0,
         "showdown_hands": 0,
         "shown_hand_classes": {},
         "streets": {street: _street_counts() for street in STREETS},
@@ -245,6 +247,17 @@ class OpponentModel:
                 counts["actions"] += 1
                 hand["lines"][name][street].append(action.kind)
                 if street == "preflop":
+                    # Only BB facing the SB's first normal-sized open.
+                    # Do not mix folds to 3-bets, shoves or multiway opens.
+                    if (len(hand["teams"]) == 2 and pid != game_state.button
+                            and hand["preflop_raises"] == 1 and facing
+                            and old_bet == game_state.big_blind
+                            and 2 * game_state.big_blind <= current_bet <= 3 * game_state.big_blind):
+                        key = "hu_bb_open_opportunities"
+                        record[key] = record.get(key, 0) + 1
+                        if action.kind == "fold":
+                            key = "hu_bb_open_folds"
+                            record[key] = record.get(key, 0) + 1
                     hand["preflop_acted"].add(name)
                     if action.kind == "raise":
                         # A definite raise is VPIP/PFR regardless of any
@@ -369,6 +382,23 @@ class OpponentModel:
                     PRIOR_RATES["bet_unopened"]),
             }
         return record
+
+    def supports_blind_steal(self, team):
+        """Require a 95% Wilson lower fold-rate bound above 70%.
+
+        Exact-context public observations only. Missing fields in older
+        pickles mean no evidence, never automatic exploitation.
+        """
+        record = self._records.get(team, {})
+        n = record.get("hu_bb_open_opportunities", 0)
+        if n < 20:
+            return False
+        p = record.get("hu_bb_open_folds", 0) / n
+        z2 = 1.96 ** 2
+        lower = (p + z2 / (2 * n)
+                 - 1.96 * (p * (1 - p) / n + z2 / (4 * n * n)) ** 0.5
+                 ) / (1 + z2 / n)
+        return lower > 0.70
 
     def preflop_range_weight(self, team, cards, action=None):
         """Positive *relative* combo weight, not a probability or solved range.

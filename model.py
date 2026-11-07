@@ -213,7 +213,12 @@ class Model:
                         return self._raise(game_state, game_state.max_raise_to)
                     if effective_bb <= 11 and hand in HU_SHOVE_11BB:
                         return self._raise(game_state, game_state.max_raise_to)
-                    if hand in HU_OPEN:
+                    if hand in HU_OPEN or (
+                        effective_bb >= 15 and game_state.can_raise
+                        and self.opponent_model.supports_blind_steal(
+                            game_state.teams[1 - self.player_id]
+                        )
+                    ):
                         target = round((2.0 if effective_bb <= 12 else 2.3) * bb)
                         return self._raise(game_state, target)
                     if hand in HU_FOLD_UNOPENED:
