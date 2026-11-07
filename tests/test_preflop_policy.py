@@ -179,3 +179,61 @@ def test_below_large_bet_threshold_all_in_still_uses_equity():
     state.process_action(shove)
     action = _decision("7H 2C", state, [shove])
     assert action.kind == "fold"
+
+
+@pytest.mark.parametrize("hole", ["AH AD", "9H 9D"])
+def test_three_seated_players_but_only_one_live_all_in_opponent(hole):
+    """A folded seat must not disable defence against a short all-in."""
+    state = GameState([120, 500, 500])
+    shove = PlayerAction.raise_to(0, 120)
+    fold = PlayerAction.fold(1)
+    state.process_action(shove)
+    state.process_action(fold)
+
+    assert state.num_players == 3
+    assert state.players_in_hand == [0, 2]
+    assert state.status(0) == "all_in"
+    assert state.to_act == 2
+    assert state.call_amount == 100
+    assert state.can_raise is False
+
+    response = _decision(hole, state, [shove, fold])
+    assert response.kind == "call"
+    state.process_action(response)
+    assert state.is_street_closed
+
+
+@pytest.mark.parametrize("hole", ["AH AD", "9H 9D"])
+def test_multiway_all_in_defence_samples_every_surviving_opponent(hole):
+    """Two opponents are all-in, and both count towards showdown equity."""
+    state = GameState([120, 120, 500])
+    shove = PlayerAction.raise_to(0, 120)
+    call = PlayerAction.call(1)
+    state.process_action(shove)
+    state.process_action(call)
+
+    assert state.num_players == 3
+    assert state.players_in_hand == [0, 1, 2]
+    assert state.status(0) == state.status(1) == "all_in"
+    assert state.to_act == 2
+    assert state.can_raise is False
+
+    response = _decision(hole, state, [shove, call])
+    assert response.kind == "call"
+    state.process_action(response)
+    assert state.is_street_closed
+
+
+def test_one_all_in_does_not_block_value_raise_against_active_player():
+    """When another opponent can still act, this is NOT a closed all-in pot."""
+    state = GameState([120, 500, 500])
+    shove = PlayerAction.raise_to(0, 120)
+    call = PlayerAction.call(1)
+    state.process_action(shove)
+    state.process_action(call)
+
+    assert state.status(0) == "all_in"
+    assert state.status(1) == "active"
+    assert state.can_raise is True
+    response = _decision("AH AD", state, [shove, call])
+    assert response.kind == "raise"
