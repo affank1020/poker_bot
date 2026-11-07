@@ -131,3 +131,40 @@ def test_result_frozen_and_bounded_runtime():
     with pytest.raises(FrozenInstanceError):
         result.equity = 0.1
     assert time.monotonic() - started < 10  # Loose bound for shared CI
+
+
+def test_relative_weight_scaling_and_duplicate_orientation_cannot_overflow():
+    hero, board = cards("AH AD"), cards("2C 7D 9H JS QC")
+    for scale in (1.0, 1e200, 1e-200):
+        result = estimate_equity(hero, board, ranges=[{
+            cards("9S 9D"): scale, cards("KH KD"): 3 * scale,
+        }])
+        assert result.exact and result.equity == pytest.approx(0.75)
+    # The reversed pair keys describe the same hand; their raw weight
+    # sum overflows a float, but the resulting exact equity must be valid.
+    result = estimate_equity(hero, board, ranges=[{
+        cards("9S 9D"): 1e308, cards("9D 9S"): 1e308,
+        cards("KH KD"): 1e308,
+    }])
+    assert result.exact and result.equity == pytest.approx(1 / 3)
+
+
+def test_exact_multiway_handles_underflowing_joint_weight():
+    hero, board = cards("AS AD"), cards("AH AC 2D 3H 4S")
+    # Only the joint deal made of two 1e-200 entries can exist:
+    # its product is 1e-400, which underflows ordinary floating-point.
+    first = {cards("KC KD"): 1.0, cards("QC QD"): 1e-200}
+    second = {cards("KC QC"): 1.0, cards("KD JD"): 1e-200}
+    result = estimate_equity(hero, board, opponents=2, ranges=[first, second])
+    assert result.exact and result.trials == 1 and result.equity == 1.0
+
+
+def test_huge_requested_exact_limit_cannot_bypass_hard_cap():
+    # Uniform three-opponent river ranges yield 990^3 candidate deals.
+    # Even a very large caller override must use bounded MC instead.
+    result = estimate_equity(
+        cards("2C 3D"), cards("AS KS QS JS TS"), opponents=3,
+        samples=4, seed=5, exact_limit=1_000_000_000
+    )
+    assert not result.exact and result.trials == 4
+    assert result.equity == pytest.approx(0.25)
