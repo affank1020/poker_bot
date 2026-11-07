@@ -289,6 +289,9 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--deals, --times and --timeout must be positive")
     script = Path(__file__).resolve()
     repository = script.parents[1]
+    # Running a file in tools/ makes sys.path[0] tools/, not the repo root.
+    # Only the benchmark parent needs the unchanged evals.stats helper.
+    sys.path.insert(0, str(repository))
     candidate = (args.candidate_root or repository).resolve()
     if not (candidate / "model.py").is_file():
         parser.error("--candidate-root must contain model.py")
