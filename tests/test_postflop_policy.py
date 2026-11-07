@@ -392,3 +392,23 @@ def test_bad_sidepot_ledger_folds_safely_without_payout_estimation():
     assert decide_postflop(
         cards("AH 7C"), 0, view, contributions=(120, 30, 100), seed=2
     ).kind == "fold"
+
+
+def test_public_contribution_ledger_recovers_previous_street_all_in():
+    from sidepot_equity import ContributionLedger
+
+    tracker = ContributionLedger()
+    late = View(
+        street="river", board=cards("2H 3D 4C 5S 9H"),
+        pot=370, bets=(0, 0, 100), stacks=(380, 0, 280),
+        players_in_hand=(0, 1, 2),
+    )
+    assert tracker.observe(late) is None  # Refuse to invent initial stacks.
+    opening = View(
+        street="preflop", board=(), pot=50, bets=(10, 20, 20),
+        stacks=(490, 10, 480), players_in_hand=(0, 1, 2),
+    )
+    assert tracker.observe(opening) == (10, 20, 20)
+    assert tracker.observe(late) == (120, 30, 220)
+    tracker.reset()
+    assert tracker.observe(late) is None
