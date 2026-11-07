@@ -19,6 +19,7 @@ import random
 from card_utils import Card, evaluate
 from equity_engine import ComboWeights, estimate_equity
 from player_action import PlayerAction
+from sidepot_equity import estimate_call_payout
 
 STREET_SETTINGS = {
     # street: value threshold, raise-for-value threshold, call margin, bet pot fraction
@@ -92,6 +93,7 @@ def decide_postflop(
     seed: int | None = None,
     samples: int | None = None,
     facing_aggression: bool = False,
+    contributions: Sequence[int] | None = None,
 ) -> PlayerAction:
     """Make a legal, bounded postflop betting decision.
 
@@ -102,6 +104,10 @@ def decide_postflop(
     If conditioning on opponent ranges yields an impossible/collision-heavy
     joint model, explicitly fall back to the broad prior rather than risking
     an illegal or missing action during a tournament call.
+
+    Pass `contributions` as complete per-seat commitments (all prior streets,
+    folded seats included) for accurate main/side-pot payouts when another
+    opponent is all-in. GameStateView cannot reconstruct this history alone.
     """
     street = view.street
     if street not in STREET_SETTINGS or len(view.board) not in (3, 4, 5):
@@ -118,6 +124,74 @@ def decide_postflop(
             hero, view.board, opponents, ranges=assumed_ranges,
             samples=budget, seed=decision_seed,
         )
+
+    # Global showdown equity incorrectly counts a short all-in player as
+    # eligible for every pot, even when hero can still beat the deep player
+    # to win an enormous side pot. Full previous-street contributions are
+    # not in GameStateView; use a caller-maintained exact public ledger.
+    cost = view.call_amount
+    if contributions is not None:
+        ledger = tuple(contributions)
+        if (
+            len(ledger) != len(view.stacks)
+            or any(type(x) is not int or x < 0 for x in ledger)
+            or sum(ledger) != view.pot
+            or any(ledger[i] < view.bets[i] for i in range(len(ledger)))
+        ):
+            return _safe_action(view, player_id)
+        short_all_in = (
+            cost > 0 and opponents > 1
+            and any(
+                view.stacks[seat] == 0
+                and ledger[seat] < ledger[player_id] + cost
+                for seat in view.players_in_hand if seat != player_id
+            )
+        )
+        if short_all_in:
+            live = tuple(seat for seat in view.players_in_hand if seat != player_id)
+            folded = tuple(seat not in view.players_in_hand for seat in range(len(ledger)))
+
+            def estimate_tiered(assumed_ranges):
+                return estimate_call_payout(
+                    hero, view.board, player_id,
+                    contributions=ledger, folded=folded,
+                    opponents=live, call_cost=cost, button=view.button,
+                    ranges=assumed_ranges, samples=budget, seed=decision_seed,
+                )
+
+            try:
+                tiered = estimate_tiered(ranges)
+            except ValueError:
+                try:
+                    tiered = estimate_tiered(None)
+                except ValueError:
+                    return _safe_action(view, player_id)
+            minimum_trials = max(1, (budget + 1) // 2)
+            if not tiered.exact and tiered.trials < minimum_trials:
+                if ranges is not None:
+                    try:
+                        tiered = estimate_tiered(None)
+                    except ValueError:
+                        return _safe_action(view, player_id)
+                if not tiered.exact and tiered.trials < minimum_trials:
+                    return _safe_action(view, player_id)
+            margin = STREET_SETTINGS[street][2] + 0.05  # Multiway.
+            if facing_aggression:
+                margin += 0.035
+            if cost >= max(
+                view.big_blind * 3,
+                int(0.8 * max(1, tiered.eligible_pot - cost)),
+            ):
+                margin += 0.035
+            # Marginal call EV = expected tier-eligible payout - call cost.
+            # Extra positive EV is required to offset model uncertainty.
+            # Raising would change the eligibility ledger and needs
+            # opponent-response modelling, so use call/fold only here.
+            return (
+                PlayerAction.call(player_id)
+                if tiered.expected_chips >= cost + margin * tiered.eligible_pot
+                else PlayerAction.fold(player_id)
+            )
 
     try:
         result = sample_equity(ranges)
