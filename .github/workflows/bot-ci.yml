@@ -1,0 +1,42 @@
+name: Poker bot CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bot-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Python validity and submission checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements-dev.txt
+
+      - name: Test bot legality and preflop policy
+        run: python -m pytest tests/test_model.py tests/test_preflop_policy.py -q
+
+      - name: Validate actual submission packaging
+        run: |
+          mkdir -p /tmp/poker-bot-ci
+          python -m submit --team ci_bot --out /tmp/poker-bot-ci
