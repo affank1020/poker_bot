@@ -42,9 +42,32 @@ Use:
     )
     showdown_share = result.equity
 
-The A1 return method above is *illustrative*: adapt only this boundary to its
-final API. A null mapping means uniform. Each mapping must contain 2-Card
-tuple keys, not string chart labels.
+**Actual A1 PR #5 API:** opponent_model.py currently exposes
+preflop_range_weight(team, two_cards, action=None) as a positive relative
+weight for a concrete combo, plus hand_line(team), profile(team), and public
+street-action history. An integration adapter can build the mapping without
+coupling either module:
+
+    from itertools import combinations
+    from card_utils import full_deck
+    dead = set(self.hand) | set(game_state.board)
+    available = [c for c in full_deck() if c not in dead]
+    weights = [
+        {
+            combo: opponent_model.preflop_range_weight(
+                game_state.teams[p], combo
+            )
+            for combo in combinations(available, 2)
+        }
+        for p in opponents
+    ]
+
+For unknown opponents or insufficient observations, prefer None / broad
+priors; avoid treating preflop-only action weights as a calibrated postflop
+posterior. The producer may refine the distribution using street lines later.
+Each mapping must contain concrete 2-Card tuple keys, not chart labels.
+A1 does not currently expose range_weights(), so the earlier example is a
+future-facing interface, not an implemented method.
 
 The result contains equity (expected fraction of pot won, correctly splitting
 ties), win_rate, tie_rate, trials and exact. With a complete river board and
