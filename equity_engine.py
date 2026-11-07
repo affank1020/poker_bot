@@ -24,11 +24,11 @@ No network, dynamic file reads, global mutable state, or other dependencies.
 
 from __future__ import annotations
 
-from bisect import bisect_left
+from bisect import bisect_right
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from itertools import combinations, product
-from math import isfinite, prod
+from math import exp, isfinite, log, log1p, prod
 import random
 
 from card_utils import Card, evaluate, full_deck
@@ -37,7 +37,8 @@ from card_utils import Card, evaluate, full_deck
 # team, street, and public action history. None means an uninformative prior.
 ComboWeights = Mapping[tuple[Card, Card], float]
 MAX_SAMPLES = 2_000
-DEFAULT_EXACT_LIMIT = 1_400
+MAX_EXACT_STATES = 1_400  # Hard limit even with an enormous exact_limit argument.
+DEFAULT_EXACT_LIMIT = MAX_EXACT_STATES
 _ATTEMPTS_PER_SAMPLE = 24
 
 
@@ -56,11 +57,12 @@ class EquityResult:
 class _Distribution:
     combos: tuple[tuple[Card, Card], ...]
     weights: tuple[float, ...]
+    log_weights: tuple[float, ...]
     cumulative: tuple[float, ...]
     total: float
 
     def draw(self, rng: random.Random) -> tuple[Card, Card]:
-        index = bisect_left(self.cumulative, rng.random() * self.total)
+        index = bisect_right(self.cumulative, rng.random() * self.total)
         return self.combos[min(index, len(self.combos) - 1)]
 
 
@@ -72,10 +74,13 @@ def _normalize_range(
     source: ComboWeights | None, available: Sequence[Card]
 ) -> _Distribution:
     permitted = set(available)
-    merged: dict[tuple[Card, Card], float] = {}
+    # Preserve relative scale in logarithms. Summing duplicate reversed
+    # combos as floats could overflow (1e308 + 1e308), while tiny positive
+    # weights must remain available for exact joint enumeration.
+    merged_logs: dict[tuple[Card, Card], float] = {}
     if source is None:
         for combo in combinations(available, 2):
-            merged[combo] = 1.0
+            merged_logs[combo] = 0.0
     else:
         for cards, weight in source.items():
             if len(cards) != 2 or not all(isinstance(card, Card) for card in cards):
@@ -83,28 +88,40 @@ def _normalize_range(
             first, second = cards
             if first == second:
                 raise ValueError("range includes a repeated card")
-            if not isinstance(weight, (int, float)) or not isfinite(weight) or weight < 0:
+            if (
+                not isinstance(weight, (int, float))
+                or weight < 0
+                or (isinstance(weight, float) and not isfinite(weight))
+            ):
                 raise ValueError("range weights must be finite and nonnegative")
             if weight == 0 or first not in permitted or second not in permitted:
                 continue
             combo = tuple(sorted((first, second), key=_key))
-            merged[combo] = merged.get(combo, 0.0) + float(weight)
+            current_log = log(weight)
+            previous = merged_logs.get(combo)
+            if previous is None:
+                merged_logs[combo] = current_log
+            else:
+                # Stable log(exp(previous) + exp(current_log)).
+                peak = max(previous, current_log)
+                merged_logs[combo] = peak + log1p(exp(-abs(previous - current_log)))
 
-    if not merged:
+    if not merged_logs:
         raise ValueError("opponent range has no possible unblocked combinations")
     ordered = sorted(
-        merged.items(), key=lambda pair: (_key(pair[0][0]), _key(pair[0][1]))
+        merged_logs.items(), key=lambda pair: (_key(pair[0][0]), _key(pair[0][1]))
     )
     combos = tuple(combo for combo, _ in ordered)
-    weights = tuple(weight for _, weight in ordered)
+    log_weights = tuple(log_weight for _, log_weight in ordered)
+    # Scale the largest hand weight to one for bounded cumulative draws.
+    peak = max(log_weights)
+    weights = tuple(exp(value - peak) for value in log_weights)
     cumulative = []
     running = 0.0
     for weight in weights:
         running += weight
         cumulative.append(running)
-    if not isfinite(running) or running <= 0:
-        raise ValueError("range weight sum must be finite and positive")
-    return _Distribution(combos, weights, tuple(cumulative), running)
+    return _Distribution(combos, weights, log_weights, tuple(cumulative), running)
 
 
 def _outcome(
@@ -126,12 +143,14 @@ def _exact_river(
     hero_rank = evaluate(hero + board)
     weighted_equity = weighted_wins = weighted_ties = total = 0.0
     valid_deals = 0
+    max_joint_log = None
 
-    # Called only if the Cartesian-product count is within exact_limit.
+    # Exact computation is permitted only when its input product has been
+    # hard-capped to MAX_EXACT_STATES by estimate_equity.
     ranked = [
         tuple(
-            (combo, weight, evaluate(combo + board))
-            for combo, weight in zip(dist.combos, dist.weights)
+            (combo, log_weight, evaluate(combo + board))
+            for combo, log_weight in zip(dist.combos, dist.log_weights)
         )
         for dist in distributions
     ]
@@ -139,7 +158,22 @@ def _exact_river(
         cards = tuple(card for item in deal for card in item[0])
         if len(set(cards)) != len(cards):
             continue
-        weight = prod(item[1] for item in deal)
+        joint_log = sum(item[1] for item in deal)
+        # Rescale weighted running totals to the largest valid log weight.
+        # Thus collision-only low-weight deals (e.g. 1e-400) remain valid.
+        if max_joint_log is None:
+            max_joint_log = joint_log
+            weight = 1.0
+        elif joint_log > max_joint_log:
+            scale = exp(max_joint_log - joint_log)
+            weighted_equity *= scale
+            weighted_wins *= scale
+            weighted_ties *= scale
+            total *= scale
+            max_joint_log = joint_log
+            weight = 1.0
+        else:
+            weight = exp(joint_log - max_joint_log)
         share, win, tie = _outcome(hero_rank, [item[2] for item in deal])
         total += weight
         weighted_equity += weight * share
@@ -147,7 +181,7 @@ def _exact_river(
         weighted_ties += weight * tie
         valid_deals += 1
 
-    if not total or not isfinite(total):
+    if not valid_deals:
         raise ValueError("no possible collision-free opponent hands")
     return EquityResult(
         weighted_equity / total, weighted_wins / total,
@@ -169,7 +203,8 @@ def estimate_equity(
     """Estimate the hero's showdown pot share against plausible opponent hands.
 
     Uses weighted exact enumeration on a river if the product of opponent
-    range sizes fits exact_limit (by default, a full heads-up river).
+    range sizes fits min(exact_limit, MAX_EXACT_STATES), so callers
+    cannot bypass the fixed tournament-work ceiling.
     Otherwise samples up to samples collision-free showdown deals.
 
     With very restrictive or mutually incompatible multiway ranges, trials
@@ -209,7 +244,7 @@ def estimate_equity(
     )
     if len(board) == 5 and exact_river and exact_limit > 0:
         states = prod(len(dist.combos) for dist in distributions)
-        if states <= exact_limit:
+        if states <= min(exact_limit, MAX_EXACT_STATES):
             return _exact_river(tuple(hero), tuple(board), distributions)
 
     rng = random.Random(seed)
