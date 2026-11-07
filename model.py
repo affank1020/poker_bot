@@ -145,27 +145,29 @@ class Model:
         stats = self._primary_opponent_stats(game_state)
         opponents = max(1, len(game_state.players_in_hand) - 1)
 
-        # All-in defence is about whether MORE betting remains possible,
-        # not the number of seats originally at the table. An all-in player
-        # can coexist with active players, so inspect every surviving
-        # opponent. With all opponents already all-in there is no further
-        # betting; ordinary open/3-bet calling caps must not fold premiums.
+        # Calls that exhaust our stack and calls versus opponents who are
+        # all-in must bypass ordinary open/3-bet sizing caps. In both cases
+        # we cannot make further betting decisions: assess the chips we can
+        # actually win, including main/side pots, rather than treat a small
+        # call as a fraction of our previous stack size.
         remaining_opponents = [
             player for player in game_state.players_in_hand
             if player != self.player_id
         ]
-        if (
-            cost > 0
-            and remaining_opponents
-            and all(
-                game_state.status(player) == "all_in"
-                for player in remaining_opponents
-            )
+        hero_call_is_all_in = cost > 0 and cost == stack
+        opponents_all_in = bool(remaining_opponents) and all(
+            game_state.status(player) == "all_in"
+            for player in remaining_opponents
+        )
+        if cost > 0 and remaining_opponents and (
+            hero_call_is_all_in or opponents_all_in
         ):
-            # Calling closes the action, but unequal all-in stacks create
-            # separate main/side pots. Outright showdown equity would miss
-            # side-pot wins, so compare *expected chips returned* against
-            # the incremental cost of calling instead.
+            # Unequal all-in stacks create separate main/side pots.
+            # Evaluate *expected chips returned* rather than outright
+            # showdown equity. When opponents remain active after our
+            # own all-in, freeze their current contributions and assume
+            # they all reach showdown: subsequent folds can only improve
+            # our share of the already-contested pots.
             samples = 280 if len(remaining_opponents) <= 2 else 160
             payout = expected_call_payout(
                 self.hand,
