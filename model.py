@@ -183,6 +183,11 @@ class Model:
             # they all reach showdown: subsequent folds can only improve
             # our share of the already-contested pots.
             samples = 280 if len(remaining_opponents) <= 2 else 160
+            conditioned_range = None
+            if heads_up and opponents_all_in:
+                conditioned_range = self._tight_shove_range(game_state)
+            range_kwargs = ({"opponent_range": conditioned_range}
+                            if conditioned_range is not None else {})
             payout = expected_call_payout(
                 self.hand,
                 list(game_state.board),
@@ -193,6 +198,7 @@ class Model:
                 cost,
                 samples=samples,
                 seed=self.random_seed,
+                **range_kwargs,
             )
             self.random_seed = (
                 self.random_seed * 1103515245 + 12345
@@ -287,6 +293,30 @@ class Model:
         ):
             return PlayerAction.call(self.player_id)
         return self._check_or_fold(game_state)
+
+    def _tight_shove_range(self, game_state):
+        """Experimental HU all-in prior, gated by completed public history.
+
+        A low observed PFR supports a value-heavy shove prior, but does not
+        identify exact cards. Keep half of the probability mass uniform.
+        Never apply this to unknown opponents, wide raisers or multiway.
+        """
+        if game_state.num_players != 2:
+            return None
+        seat = 1 - self.player_id
+        team = game_state.teams[seat]
+        profile = self.opponent_model.profile(team)
+        if (profile["preflop_opportunities"] < 24
+                or profile["pfr_hands"] < 3
+                or profile["rates"]["pfr"] > 0.20):
+            return None
+        if "raise" not in self.opponent_model.hand_line(team).get("preflop", ()):
+            return None
+        deck = [card for card in full_deck() if card not in self.hand]
+        combos = list(combinations(deck, 2))
+        strong = {pair for pair in combos if hand_class(pair) in HU_THREE_BET}
+        bonus = 0.5 * len(combos) / len(strong)
+        return {pair: 0.5 + (bonus if pair in strong else 0.0) for pair in combos}
 
     def _opponent_ranges(self, game_state):
         """Conservative, seat-ordered A1 combo priors; None means uniform.
